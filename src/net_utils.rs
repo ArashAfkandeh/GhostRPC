@@ -1,9 +1,64 @@
 use bytes::{Bytes, BytesMut};
 use rand::Rng;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use socket2::{SockRef, TcpKeepalive};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::warn;
+
+/// Verifier سهل‌گیر برای مسیر QUIC/H3: زنجیره‌ی گواهی سرور را بررسی نمی‌کند
+/// چون سرور REALITY (برای کلاینت‌های مجاز) یک گواهی موقت خودامضا ارائه
+/// می‌دهد. اعتماد واقعی روی AEAD مشترک (secret) است، نه روی PKI عمومی.
+#[derive(Debug)]
+pub struct NoCertVerification;
+
+impl ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
 
 // ==========================================
 // 2. TCP KEEPALIVE (بخشی از "2. TCP KEEPALIVE & CRYPTO")
@@ -23,6 +78,23 @@ pub fn frame_grpc(data: &[u8]) -> Bytes {
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
     buf.freeze()
+}
+
+/// یک گواهی خود-امضا (Self-Signed) و کلید خصوصی موقت و صرفاً در حافظه
+/// می‌سازد. سرور دیگر نیازی به گواهی واقعیِ سایت هدف (یا هیچ گواهی روی
+/// دیسک) ندارد؛ این گواهی فقط برای کلاینت‌هایی که از قبل از طریق کانال
+/// SNI/HMAC احراز هویت شده‌اند به‌کار می‌رود و چون آن کلاینت‌ها اعتبارسنجی
+/// زنجیره‌ی گواهی را عمداً غیرفعال کرده‌اند (امنیت واقعی از AEAD مشترک
+/// تامین می‌شود، نه از PKI)، خود-امضا بودن آن مشکلی ایجاد نمی‌کند.
+pub fn generate_ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let subject_alt_names = vec!["localhost".to_string()];
+    let cert_key = rcgen::generate_simple_self_signed(subject_alt_names)
+        .expect("Failed to generate ephemeral REALITY certificate");
+
+    let cert_der = CertificateDer::from(cert_key.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()));
+
+    (vec![cert_der], key_der)
 }
 
 pub fn get_random_headers() -> Vec<(&'static str, &'static str)> {

@@ -17,9 +17,17 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub secret: String,
     pub hidden_path: String,
-    pub tls_cert: String,
-    pub tls_key: String,
-    pub reality_fallback_url: String,
+    // این دامنه‌ی پوششی (مثلاً "www.ubuntu.com") همانی است که ترافیک
+    // غیرمجاز/اسکنرها به صورت خام (Layer-4 Splice) به آن هدایت می‌شوند.
+    pub camouflage_domain: Option<String>,
+    // آدرس IP:Port واقعی سرور هدف که در صورت عدم احراز هویت، اتصال TCP
+    // به صورت کاملاً خام (بدون دخالت در محتوا) به آن Forward می‌شود.
+    pub reality_target_addr: Option<String>,
+    
+    // فیلدهای قدیمی جهت سازگاری با نسخه‌های قبل
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub reality_fallback_url: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

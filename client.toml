@@ -10,11 +10,13 @@ port_mappings = [
 [[client.remotes]]
 name = "node-cloudflare"
 addr = "198.51.100.25:443"
-sni = "www.speedtest.net"
+# باید دقیقاً برابر camouflage_domain در server.toml سرور مقصد باشد.
+# کلاینت خودش هر بار یک ساب‌دامین HMAC چرخشی جلوی آن اضافه می‌کند.
+sni = "www.ubuntu.com"
 host = "app.yourdomain.com"
 
 [[client.remotes]]
 name = "node-direct"
 addr = "198.51.100.26:443"
-sni = "app2.yourdomain.com"
+sni = "www.ubuntu.com"
 host = "app2.yourdomain.com"

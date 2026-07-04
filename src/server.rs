@@ -1,32 +1,92 @@
 use crate::config::ServerConfig;
-use crate::crypto::{decrypt_payload, derive_cipher, encrypt_payload};
-use crate::net_utils::{enable_tcp_keepalive, frame_grpc, get_random_headers};
+use crate::crypto::{decrypt_payload, derive_cipher, encrypt_payload, is_authorized_sni};
+use crate::net_utils::{enable_tcp_keepalive, frame_grpc, generate_ephemeral_cert, get_random_headers};
+use crate::routing::extract_sni;
 
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use quinn::{ServerConfig as QuinnServerConfig, Endpoint};
-use std::{fs, sync::Arc};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info, warn};
+
+// حداکثر بایتی که برای استخراج ClientHello/SNI با peek() بررسی می‌شود
+const PEEK_BUF_SIZE: usize = 8192;
+// حداکثر زمان انتظار برای رسیدن کامل ClientHello (میلی‌ثانیه)
+const PEEK_TIMEOUT_MS: u64 = 400;
+
+/// بدون این‌که حتی یک بایت از سوکت مصرف (Consume) شود، منتظر می‌ماند تا
+/// ClientHello کامل برسد و SNI آن را استخراج می‌کند. چون از peek() استفاده
+/// می‌شود، بایت‌ها همچنان در بافر کرنل باقی می‌مانند و چه مسیر Splice خام
+/// و چه مسیر TLS Terminate محلی انتخاب شود، همان جریان اصلی TCP بدون هیچ
+/// کپی/بازپخش دستی مصرف خواهد شد.
+async fn peek_sni(tcp: &TcpStream) -> Option<String> {
+    let mut buf = vec![0u8; PEEK_BUF_SIZE];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PEEK_TIMEOUT_MS);
+    loop {
+        if let Ok(n) = tcp.peek(&mut buf).await {
+            if n > 0 {
+                if let Some(sni) = extract_sni(&buf[..n]) {
+                    return Some(sni);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline { return None; }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+/// مسیر عدم-احراز-هویت: اتصال TCP به صورت کاملاً خام (Layer-4) به سرور هدف
+/// واقعی وصل و بدون هیچ دخالتی Splice می‌شود. از آن‌جا که هیچ داده‌ای رمزگشایی،
+/// بازتولید یا Fetch نمی‌شود، سرعت و هدرها دقیقاً همان سرور هدف واقعی است؛
+/// نه تاخیر Fetch-and-Serve وجود دارد و نه امکان نشت هدر.
+async fn splice_to_real_target(mut client_tcp: TcpStream, target_addr: &str) {
+    match TcpStream::connect(target_addr).await {
+        Ok(mut target_tcp) => {
+            let _ = target_tcp.set_nodelay(true);
+            enable_tcp_keepalive(&target_tcp);
+            if let Err(e) = tokio::io::copy_bidirectional(&mut client_tcp, &mut target_tcp).await {
+                debug!("Splice session ended: {}", e);
+            }
+        }
+        Err(e) => {
+            warn!("⚠️ Could not reach reality_target_addr ({}): {} — dropping connection", target_addr, e);
+        }
+    }
+}
 
 pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     let cipher = Arc::new(derive_cipher(&cfg.secret));
+
+    // ============================
+    // گواهی موقت (Ephemeral Self-Signed Certificate)
+    // ----------------------------
+    // دیگر نیازی به tls_cert/tls_key واقعی روی دیسک نیست. این سرتیفیکیت فقط
+    // برای کلاینت‌های خودمان (که از قبل با HMAC بر پایه‌ی SNI احراز هویت
+    // شده‌اند و اعتبارسنجی زنجیره‌ی گواهی را در سمت کلاینت خاموش کرده‌اند)
+    // استفاده می‌شود؛ نه برای کاربران/اسکنرهایی که هرگز به این مرحله نمی‌رسند.
+    // ============================
+    let (certs, key_tcp, key_quic) = if let (Some(cert_path), Some(key_path)) = (&cfg.tls_cert, &cfg.tls_key) {
+        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert_path).unwrap())).map(|r| r.unwrap()).collect();
+        let key_bytes = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(std::fs::File::open(key_path).unwrap())).next().unwrap().unwrap();
+        (certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key_bytes.clone_key()), rustls::pki_types::PrivateKeyDer::Pkcs8(key_bytes))
+    } else {
+        let (c, k1) = generate_ephemeral_cert();
+        let (_, k2) = generate_ephemeral_cert();
+        (c, k1, k2)
+    };
     
-    // لود کردن Certificate ها
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(&cfg.tls_cert).unwrap())).map(|r| r.unwrap()).collect();
-    let key_tcp = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(fs::File::open(&cfg.tls_key).unwrap())).next().unwrap().unwrap();
-    let key_quic = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(fs::File::open(&cfg.tls_key).unwrap())).next().unwrap().unwrap();
 
     // ============================
     // 1. TCP Server (H2 Tunneling)
     // ============================
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(key_tcp))
+        .with_single_cert(certs.clone(), key_tcp)
         .unwrap();
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
@@ -38,14 +98,19 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     // ============================
     let mut quic_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key_quic))
+        .with_single_cert(certs, key_quic)
         .unwrap();
     quic_crypto.alpn_protocols = vec![b"h3".to_vec()]; // تظاهر به HTTP/3 برای فرار از سیستم فیلترینگ
     
     let quic_config = QuinnServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(quic_crypto).unwrap()));
     let quic_endpoint = Endpoint::server(quic_config, cfg.bind_addr.parse().unwrap()).unwrap();
 
-    info!("🛡️ TCP & QUIC (UDP) Server listening concurrently on {}", cfg.bind_addr);
+    let fallback_camo = cfg.reality_fallback_url.as_deref()
+        .and_then(|u| u.trim_start_matches("https://").trim_start_matches("http://").split('/').next())
+        .unwrap_or("www.ubuntu.com");
+    let print_target = cfg.reality_target_addr.as_deref().unwrap_or(fallback_camo);
+    info!("🛡️ TCP & QUIC (UDP) Server listening concurrently on {} (REALITY-style L4 splice active, target={})", cfg.bind_addr, print_target);
+    warn!("ℹ️ توجه: مسیر UDP/QUIC فعلاً به Splice خام لایه ۴ مجهز نیست (محدودیت شناخته‌شده — به README مراجعه کنید).");
 
     // اسپاون کردن روتین QUIC (کاملاً مستقل از TCP)
     let cancel_quic = cancel_token.clone();
@@ -126,25 +191,59 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                 break;
             }
             accept_res = listener.accept() => {
-                if let Ok((tcp, _peer)) = accept_res {
+                if let Ok((tcp, peer)) = accept_res {
                     let _ = tcp.set_nodelay(true);
                     enable_tcp_keepalive(&tcp);
 
                     let acceptor = acceptor.clone();
                     let cfg_path = cfg.hidden_path.clone();
-                    let cfg_fallback = cfg.reality_fallback_url.clone();
+                    let cfg_secret = cfg.secret.clone();
+                    let cfg_camo_domain = cfg.camouflage_domain.clone().unwrap_or_else(|| {
+                        cfg.reality_fallback_url.as_deref()
+                            .and_then(|u| u.trim_start_matches("https://").trim_start_matches("http://").split('/').next())
+                            .unwrap_or("www.ubuntu.com")
+                            .to_string()
+                    });
+                    let cfg_target_addr = cfg.reality_target_addr.clone().unwrap_or_else(|| {
+                        format!("{}:443", cfg_camo_domain)
+                    });
                     let cipher_in = cipher.clone();
                     let cipher_out = cipher.clone();
 
                     tokio::spawn(async move {
+                        // ==========================================
+                        // REALITY-STYLE GATE (لایه ۴/۵.۵)
+                        // ------------------------------------------
+                        // پیش از هرگونه Handshake واقعی TLS، فقط با peek()
+                        // (بدون مصرف بایت) هویت کلاینت از روی SNI بررسی می‌شود.
+                        // - کلاینت اصیل ⇒ Handshake محلی با گواهی موقت.
+                        // - هرچیز دیگر (اسکنر Active Prober، مرورگر واقعی،
+                        //   بایت‌های ناقص/غیر-TLS) ⇒ Splice خام لایه ۴ به
+                        //   سرور هدف واقعی؛ صفر پردازش، صفر تاخیر اضافه،
+                        //   صفر امکان نشت هدر.
+                        // ==========================================
+                        let sni = peek_sni(&tcp).await;
+                        let authorized = sni.as_deref()
+                            .map(|s| is_authorized_sni(s, &cfg_secret, &cfg_camo_domain))
+                            .unwrap_or(false);
+
+                        if !authorized {
+                            debug!("[{}] Unauthorized/foreign ClientHello (sni={:?}) → raw L4 splice to {}", peer, sni, cfg_target_addr);
+                            splice_to_real_target(tcp, &cfg_target_addr).await;
+                            return;
+                        }
+
+                        debug!("[{}] ✅ REALITY auth OK via camouflage SNI → local tunnel termination", peer);
                         let tls_stream = match acceptor.accept(tcp).await { Ok(s) => s, Err(_) => return };
                         let mut h2 = match h2::server::handshake(tls_stream).await { Ok(h) => h, Err(_) => return };
 
                         while let Some(Ok((req, mut respond))) = h2.accept().await {
                             if req.uri().path() != cfg_path {
-                                let fallback_res = reqwest::get(&cfg_fallback).await;
-                                let status = fallback_res.as_ref().map(|r| r.status().as_u16()).unwrap_or(404);
-                                let response = http::Response::builder().status(status).body(()).unwrap();
+                                // این کلاینت از قبل در لایه SNI احراز هویت شده؛ اگر با
+                                // این‌حال مسیر درخواستش اشتباه بود، به‌جای Fetch از سایت
+                                // هدف (که یک نشتی Timing/Header دیگر می‌ساخت) فقط اتصال
+                                // بسته می‌شود.
+                                let response = http::Response::builder().status(StatusCode::NOT_FOUND).body(()).unwrap();
                                 let _ = respond.send_response(response, true);
                                 continue;
                             }

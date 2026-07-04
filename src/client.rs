@@ -1,10 +1,10 @@
 use crate::config::{ClientConfig, RemoteNode};
-use crate::crypto::{decrypt_payload, derive_cipher, encrypt_payload};
+use crate::crypto::{build_camouflage_sni, decrypt_payload, derive_cipher, encrypt_payload};
 use crate::fragment::FragmentedStream;
 use crate::net_utils::{enable_tcp_keepalive, frame_grpc, get_random_headers};
 use crate::routing::{extract_sni, parse_port_mappings};
 
-use boring::ssl::{SslConnector, SslMethod, SslOptions};
+use boring::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
 use bytes::{Bytes, BytesMut};
 use http::{Method, Request};
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
@@ -27,16 +27,26 @@ enum ClientPoolItem {
     Quic(quinn::Connection),
 }
 
-async fn connect_h2_node(remote: &RemoteNode, tls_connector: &SslConnector) -> Result<h2::client::SendRequest<Bytes>, String> {
+async fn connect_h2_node(remote: &RemoteNode, tls_connector: &SslConnector, secret: &str) -> Result<h2::client::SendRequest<Bytes>, String> {
     let tcp = TcpStream::connect(&remote.addr).await.map_err(|e| e.to_string())?;
     let _ = tcp.set_nodelay(true);
     enable_tcp_keepalive(&tcp);
     let frag_tcp = FragmentedStream { inner: tcp, first_write: false };
-    
+
     let mut config = tls_connector.configure().map_err(|e| e.to_string())?;
-    config.set_verify_hostname(false); // Can be enabled with proper roots for stealth
-    
-    let tls_stream = tokio_boring::connect(config, &remote.sni, frag_tcp).await.map_err(|e| e.to_string())?;
+    config.set_verify_hostname(false);
+    // ما دیگر به زنجیره‌ی گواهی سرور اعتماد نمی‌کنیم چون سرور REALITY، برای
+    // کلاینت‌های احرازشده، یک گواهی موقت خودامضا ارائه می‌دهد. اعتبار واقعی
+    // اتصال از طریق AEAD مشترک (derive_cipher) تامین می‌شود، نه PKI.
+    config.set_verify(SslVerifyMode::NONE);
+
+    // به‌جای remote.sni خام، یک SNI پوششی (Camouflage) می‌سازیم که یک برچسب
+    // HMAC چرخشی را به‌عنوان ساب‌دامین دامنه‌ی remote.sni حمل می‌کند. سرور
+    // REALITY فقط با دانستن `secret` می‌تواند این برچسب را تایید کند؛ برای
+    // هر ناظر/اسکنر دیگر دقیقاً شبیه یک ساب‌دامین معمولی CDN است.
+    let camo_sni = build_camouflage_sni(secret, &remote.sni);
+
+    let tls_stream = tokio_boring::connect(config, &camo_sni, frag_tcp).await.map_err(|e| e.to_string())?;
     let (client, conn) = h2::client::handshake(tls_stream).await.map_err(|e| e.to_string())?;
 
     tokio::spawn(async move {
@@ -62,10 +72,12 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     let tls_connector = Arc::new(builder.build());
 
     // 2. پیکربندی QUIC برای ارتباطات UDP (Multiplexing قدرتمند بدون Head-of-line blocking)
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // همانند مسیر H2، سرور REALITY برای QUIC هم گواهی موقت خودامضا ارائه
+    // می‌دهد، پس به‌جای اعتماد به CA Root عمومی از یک Verifier سهل‌گیر
+    // استفاده می‌شود؛ امنیت واقعی از AEAD مشترک تامین می‌شود.
     let mut quic_crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::net_utils::NoCertVerification))
         .with_no_client_auth();
     quic_crypto.alpn_protocols = vec![b"h3".to_vec()]; // تظاهر به ترافیک استاندارد HTTP/3
     let quic_client_cfg = QuinnClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(quic_crypto).unwrap()));
@@ -191,7 +203,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                 tokio::time::sleep(Duration::from_millis(1500)).await;
                                             }
                                         } else {
-                                            if let Ok(new_c) = connect_h2_node(&target_remote, &tls_inner).await {
+                                            if let Ok(new_c) = connect_h2_node(&target_remote, &tls_inner, &cfg_inner.secret).await {
                                                 *pool_slot.lock().await = Some(ClientPoolItem::H2(new_c));
                                             } else {
                                                 tokio::time::sleep(Duration::from_millis(1500)).await;

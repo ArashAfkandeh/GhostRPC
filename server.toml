@@ -2,6 +2,11 @@
 bind_addr = "0.0.0.0:443"
 secret = "My_Super_Enterprise_Secret_Key_2026!"
 hidden_path = "/api/v4/telemetry"
-tls_cert = "/etc/letsencrypt/live/app.yourdomain.com/fullchain.pem"
-tls_key = "/etc/letsencrypt/live/app.yourdomain.com/privkey.pem"
-reality_fallback_url = "https://www.ubuntu.com"
+# دیگر نیازی به tls_cert/tls_key نیست — سرور یک گواهی موقت داخلی می‌سازد.
+# این دامنه باید دقیقاً همان چیزی باشد که در client.toml روی هر remote به
+# صورت `sni = "..."` تنظیم شده (بدون ساب‌دامین HMAC؛ آن بخش پویا اضافه می‌شود).
+camouflage_domain = "www.ubuntu.com"
+# آدرس IP:Port واقعیِ همان دامنه که ترافیک غیرمجاز/اسکنرها به صورت خام
+# (Layer-4 Splice) به آن هدایت می‌شود. برای دقت بیشتر از یک IP ثابت به‌جای
+# نام دامنه استفاده کنید تا هیچ DNS Lookup اضافه‌ای در مسیر بحرانی نباشد.
+reality_target_addr = "185.125.190.20:443"

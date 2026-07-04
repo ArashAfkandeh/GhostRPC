@@ -20,6 +20,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 // ==========================================
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
 
     let initial_content = fs::read_to_string(&config_path).expect("Failed to read config");
