@@ -7,6 +7,10 @@ echo "==========================================="
 echo "   GhostRPC Auto Build Script              "
 echo "==========================================="
 
+# Go to script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # 1. Update and install basic dependencies
 echo "[*] Checking and installing basic build dependencies..."
 if command -v apt-get &> /dev/null; then
