@@ -1,44 +1,106 @@
 [client]
 
-# مسیر مخفی تونل (باید دقیقا مشابه سرور باشد)
+# رمز عبور مشترک بین سرور و کلاینت برای احراز هویت
+secret = "my_secret_password"
+
+# مسیر مخفی برای درخواست‌های تونل (باید با سرور یکی باشد)
 hidden_path = "/api/v4/telemetry"
 
-# رمز عبور تونل (باید دقیقا مشابه سرور باشد)
-secret = "my_super_secret_password"
+# دامنه‌ها و زیردامنه‌های مجاز برای برقراری تونل (SNI) - کلاینت از این دامنه‌ها برای وصل شدن استفاده می‌کند
+tunnel_sni = [
+    "domain.com",
+    "*.domain.com"
+]
 
-# (اختیاری) تعداد کانکشن‌های باز در هر نود برای اتصال سریع‌تر
+# تعداد کانکشن‌های همزمان در Pool برای هر سرور (هر نود کلاینت) - برای مدیریت بهینه ترافیک
 pool_size_per_node = 16
 
-# پشتیبانی بومی از UDP: اگر yes باشد، برای تمام پورت‌های مپ شده، سوکت UDP هم باز می‌شود
-accept_udp = "yes"
+# تنظیمات مربوط به فایل‌های آی‌پی
+clean_ip_file = "ips/clean_ips.txt"     # فایل حاوی آی‌پی‌های تمیز (برای ارتباط با سرورها)
+source_ips_file = "ips/source_ips.txt"   # فایل حاوی آی‌پی‌های مبدأ سرور ایران (برای مدیریت کانکشن‌ها)
 
-# لیست IPهای تمیز کلودفلر (ارتباطات به صورت مسابقه‌ای و هوشمند با سریع‌ترین IP برقرار می‌شود)
-clean_ip = [
-    "104.21.32.1",
-    "172.67.19.1"
+# فاصله زمانی بررسی سلامت آی‌پی‌ها (دقیقه)
+check_interval_minutes = 360
+
+# حداکثر پینگ مجاز برای آی‌پی‌های تمیز (میلی‌ثانیه)
+max_ping_ms = 150
+
+# تنظیمات دریافت خودکار گواهینامه Let's Encrypt (DNS-01 Challenge) برای دامنه‌های لوکال
+cloudflare_api_token = "YOUR_CLOUDFLARE_API_TOKEN"
+# arvancloud_api_token = "YOUR_ARVANCLOUD_API_TOKEN"
+
+# (اختیاری) کپی خودکار گواهینامه‌های تولید شده/تمدید شده به مسیرهای مشخص (پوشه certs ایجاد می‌شود)
+copy_certs_to = [
+    "/etc/xray",
+    "/opt/proxy"
 ]
 
 # (اختیاری) سطح لاگ‌گیری سیستم: "trace", "debug", "info", "warn", "error"
 log_level = "info"
 
-# سرورهای لوکیشن NL
+
+# ====================================================================
+# تنظیمات مسیریابی پورت‌ها (Remote Routing)
+# ترافیک دریافتی روی پورت‌های لوکال به کدام SNI و سپس به کدام پورت در مقصد (Target) هدایت شود.
+# ====================================================================
+
 [[client.remotes]]
-location = "NL"
+location = "Germany"
+# اگر ۱ باشد، یعنی درخواست‌ها می‌توانند از SNI‌های داخلی کلاینت استفاده کنند (ترافیک بازگشتی مجاز است)
+share_sni = 1
 sni = [
     "sni1.example.com:443",
     "sni2.example.com:443"
 ]
 port_mappings = [
     "sni.nl.example.com:443=127.0.0.1:443",
-    "1373=1373"
+    "8443=8443",    # هدایت ترافیک پورت 443 لوکال به پورت 443 مقصد
 ]
 
-# سرورهای لوکیشن DE
 [[client.remotes]]
-location = "DE"
+location = "Turkey"
+# اگر ۰ باشد، اشتراک SNI غیرفعال است.
+share_sni = 0
 sni = [
     "sni3.example.com:443"
 ]
 port_mappings = [
-    "sni.de.example.com:443=127.0.0.1:443"
+    "sni.de.example.com:443=dist.domain.com:443",
+    "8443:443",    # هدایت ترافیک پورت 8443 لوکال به پورت 443 مقصد
 ]
+
+
+# ====================================================================
+# مسیرهای مستقل کلاینت به عنوان وب‌سرور لایه ۷
+# ترافیک را روی پورت لوکال با گواهی سرور دریافت و پردازش می‌کند.
+# ====================================================================
+
+# 1. حالت استاتیک (نمایش فایل‌های HTML/CSS/JS)
+[[client.web_server]]
+domain = "static.example.com"
+path = "/"
+type = "static"
+root = "/var/www/html"
+
+# 2. حالت FastCGI (برای سایت‌های PHP مثل وردپرس)
+[[client.web_server]]
+domain = "php.example.com"
+path = "/"
+type = "fastcgi"
+root = "/var/www/wordpress"
+target = "127.0.0.1:9000"  # آدرس PHP-FPM
+SCRIPT_FILENAME = "/var/www/wordpress/index.php"
+
+# 3. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سایت‌های بک‌اند با HTTP)
+[[client.web_server]]
+domain = "panel.example.com"
+path = "/"
+type = "reverse_proxy"
+target = "http://127.0.0.1:8000"
+
+# 4. حالت Reverse Proxy (برای اتصال به سوکت‌های یونیکس مثل X-UI)
+[[client.web_server]]
+domain = "xui.example.com"
+path = "/"
+type = "reverse_proxy"
+target = "unix//var/lib/xui/xui.socket"

@@ -4,24 +4,28 @@
 bind_addr = "0.0.0.0:443"
 
 # رمز عبور مشترک بین سرور و کلاینت برای احراز هویت
-secret = "my_super_secret_password"
+secret = "my_secret_password"
 
 # مسیر مخفی برای درخواست‌های تونل (باید با کلاینت یکی باشد)
 hidden_path = "/api/v4/telemetry"
 
-# مسیر فایل‌های گواهینامه TLS (برای ارتباط امن H2/HTTPS)
-tls_cert = "fullchain.pem"
-tls_key = "privkey.pem"
-
-# هدف استتار (Active Probing Defense) - می‌تواند سایت یا مسیر فایل محلی باشد
+# هدف استتار (Active Probing Defense) - می‌تواند سایت ("https://www.ubuntu.com") یا مسیر فایل محلی ("/root/GhostRPC/html/index.html") باشد.
 camouflage_target = "https://www.ubuntu.com"
 
 # تنظیمات دریافت خودکار گواهینامه Let's Encrypt (DNS-01 Challenge)
 cloudflare_api_token = "YOUR_CLOUDFLARE_API_TOKEN"
+arvancloud_api_token = "YOUR_ARVANCLOUD_API_TOKEN"
 
-acme_domains = [
+# دامنه‌ها و زیردامنه‌های مجاز برای برقراری تونل (ترافیک این دامنه‌ها پردازش تونل می‌شود)
+tunnel_sni = [
     "domain.com",
     "*.domain.com"
+]
+
+# (اختیاری) کپی خودکار گواهینامه‌های تولید شده/تمدید شده به مسیرهای مشخص (پوشه certs ایجاد می‌شود)
+copy_certs_to = [
+    "/etc/xray",
+    "/opt/proxy"
 ]
 
 # (اختیاری) سطح لاگ‌گیری سیستم: "trace", "debug", "info", "warn", "error"
@@ -29,13 +33,45 @@ log_level = "info"
 
 # تنظیمات مسیریابی فوق‌سریع ترافیک بر اساس دامنه (SNI Routing)
 # در این بخش می‌توانید تعیین کنید که اگر کلاینت با یکی از دامنه‌های زیر به سرور متصل شد،
-# ترافیک آن بدون بازگشایی رمزنگاری (Zero-Copy) مستقیماً به آی‌پی و پورت مشخص شده (مثلاً سرور Xray) هدایت شود.
+# ترافیک آن بدون بازگشایی رمزنگاری (Zero-Copy) مستقیماً به آی‌پی و پورت مشخص شده هدایت شود.
 # فرمت: "دامنه:پورت_ورودی=آی‌پی_مقصد:پورت_مقصد"
-port_mappings = [
-    "fi.SNI.COM:443=127.0.0.2:443",
-    "fr.SNI.COM:443=127.0.0.2:443",
+sni_proxy = [
     "tr.SNI.COM:443=127.0.0.2:443",
     "de.SNI.COM:443=127.0.0.2:443",
-    "nl.SNI.COM:443=127.0.0.2:443",
-    "uk.SNI.COM:443=127.0.0.2:443",
 ]
+
+
+# ====================================================================
+# مسیرهای مستقل کلاینت به عنوان وب‌سرور لایه ۷
+# ترافیک را روی پورت لوکال با گواهی سرور دریافت و پردازش می‌کند.
+# ====================================================================
+
+# 1. حالت استاتیک (نمایش فایل‌های HTML/CSS/JS)
+[[server.web_server]]
+domain = "static.example.com"
+path = "/"
+type = "static"
+root = "/var/www/html"
+
+# 2. حالت FastCGI (برای سایت‌های PHP مثل وردپرس)
+[[server.web_server]]
+domain = "php.example.com"
+path = "/"
+type = "fastcgi"
+root = "/var/www/wordpress"
+target = "127.0.0.1:9000"  # آدرس PHP-FPM
+SCRIPT_FILENAME = "/var/www/wordpress/index.php"
+
+# 3. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سایت‌های بک‌اند با HTTP)
+[[server.web_server]]
+domain = "panel.example.com"
+path = "/"
+type = "reverse_proxy"
+target = "http://127.0.0.1:8000"
+
+# 4. حالت Reverse Proxy (برای اتصال به سوکت‌های یونیکس مثل پاسارگارد)
+[[server.web_server]]
+domain = "socket.example.com"
+path = "/"
+type = "reverse_proxy"
+target = "unix//var/lib/pasarguard/pasarguard.socket"
