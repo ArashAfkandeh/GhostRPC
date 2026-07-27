@@ -1,11 +1,13 @@
 mod acme;
 mod client;
 mod config;
+mod scanner;
 
 mod net_utils;
 mod prefixed_stream;
 mod routing;
 mod server;
+mod web_server;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -24,26 +26,65 @@ use tracing_subscriber::{fmt, EnvFilter};
 // ==========================================
 use std::path::Path;
 
-fn resolve_cert_path(path_str: &str, default_filename: &str) -> String {
+async fn gather_and_provision_acme(cf_token: Option<&str>, arvan_token: Option<&str>, tunnel_sni: Option<&Vec<String>>, web_server: Option<&Vec<crate::config::WebServerConfig>>, copy_certs_to: Option<&Vec<String>>) -> bool {
+    let mut all_snis = Vec::new();
+    if let Some(snis) = tunnel_sni {
+        all_snis.extend(snis.clone());
+    }
+    if let Some(ws_configs) = web_server {
+        for ws in ws_configs {
+            if let Some(domain) = ws.domain.split(':').next() {
+                all_snis.push(domain.to_string());
+            }
+        }
+    }
+    if all_snis.is_empty() { return false; }
+
+    let mut renewed = false;
+    if let Ok(zones) = crate::acme::extract_zone_names(cf_token, arvan_token, &all_snis).await {
+        for zone in zones {
+            if crate::acme::needs_renewal(&zone) {
+                tracing::info!("🔄 Certificate for {} needs renewal. Starting ACME...", zone);
+                if let Err(e) = crate::acme::provision_acme_cert(cf_token, arvan_token, &zone, copy_certs_to).await {
+                    tracing::error!("❌ ACME Provisioning failed for zone {}: {}", zone, e);
+                } else {
+                    renewed = true;
+                }
+            } else {
+                crate::acme::copy_existing_certs(&zone, copy_certs_to);
+            }
+        }
+    }
+    renewed
+}
+
+fn resolve_file_path(path_str: &str, default_filename: &str) -> String {
     let p = path_str.trim();
     let p = if p.is_empty() { default_filename } else { p };
     let path = Path::new(p);
     
-    if path.parent().map(|parent| parent.as_os_str().is_empty()).unwrap_or(true) {
+    let full_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
         let exe_dir = std::env::current_exe()
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
             .parent()
             .unwrap_or(Path::new(""))
             .to_path_buf();
-        
-        let certs_dir = exe_dir.join("certs");
-        if !certs_dir.exists() {
-            let _ = std::fs::create_dir_all(&certs_dir);
-        }
-        return certs_dir.join(p).to_string_lossy().to_string();
-    }
+        exe_dir.join(p)
+    };
     
-    p.to_string()
+    if let Some(parent) = full_path.parent() {
+        if !parent.exists() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    if !full_path.exists() {
+        let _ = std::fs::File::create(&full_path);
+    }
+        
+    full_path.to_string_lossy().to_string()
 }
 
 #[tokio::main]
@@ -52,12 +93,12 @@ async fn main() {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
 
     let initial_content = fs::read_to_string(&config_path).expect("Failed to read config");
-    let mut initial_config: AppConfig = toml::from_str(&initial_content).unwrap();
-    if let Some(ref mut server_cfg) = initial_config.server {
-        server_cfg.tls_cert = resolve_cert_path(&server_cfg.tls_cert, "fullchain.pem");
-        server_cfg.tls_key = resolve_cert_path(&server_cfg.tls_key, "privkey.pem");
-    }
-    let log_level = initial_config.log_level.clone().unwrap_or_else(|| "info".to_string());
+    let initial_config: AppConfig = toml::from_str(&initial_content).unwrap();
+    
+    let log_level = initial_config.log_level.clone()
+        .or_else(|| initial_config.client.as_ref().and_then(|c| c.log_level.clone()))
+        .or_else(|| initial_config.server.as_ref().and_then(|s| s.log_level.clone()))
+        .unwrap_or_else(|| "info".to_string());
 
     let filter_str = format!("h2=warn,rustls=warn,tokio_rustls=warn,GhostRPC={}", log_level);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_str));
@@ -77,33 +118,46 @@ async fn main() {
     let config_path_main = config_path.clone();
     let _ = tokio::spawn(async move {
         if let Some(server_cfg) = cfg_initial.server {
-            if server_cfg.cloudflare_api_token.is_some() {
-                if crate::acme::needs_renewal(&server_cfg.tls_cert) {
-                    if let Err(e) = crate::acme::provision_acme_cert(&server_cfg).await {
-                        tracing::error!("❌ ACME Provisioning failed: {}", e);
-                    }
-                }
-                
+            if server_cfg.cloudflare_api_token.is_some() || server_cfg.arvancloud_api_token.is_some() {
                 let s_cfg = server_cfg.clone();
                 let config_path_clone = config_path_main.clone();
                 tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(Duration::from_secs(86400)).await; // 24 hours
-                        if crate::acme::needs_renewal(&s_cfg.tls_cert) {
-                            tracing::info!("🔄 Certificate needs renewal. Starting ACME...");
-                            if let Ok(_) = crate::acme::provision_acme_cert(&s_cfg).await {
-                                // Trigger Hot-Reload by appending a comment to config
+                        if s_cfg.cloudflare_api_token.is_some() || s_cfg.arvancloud_api_token.is_some() {
+                            if gather_and_provision_acme(s_cfg.cloudflare_api_token.as_deref(), s_cfg.arvancloud_api_token.as_deref(), s_cfg.tunnel_sni.as_ref(), s_cfg.web_server.as_ref(), s_cfg.copy_certs_to.as_ref()).await {
                                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&config_path_clone) {
                                     use std::io::Write;
                                     let _ = f.write_all(b"\n# ACME Auto-Renewed\n");
                                 }
                             }
                         }
+                        tokio::time::sleep(Duration::from_secs(86400)).await; // 24 hours
                     }
                 });
             }
             run_server(server_cfg, token).await;
-        } else if let Some(client_cfg) = cfg_initial.client {
+        } else if let Some(mut client_cfg) = cfg_initial.client {
+            client_cfg.clean_ip_file = Some(resolve_file_path(&client_cfg.clean_ip_file.clone().unwrap_or_default(), "ips/clean_ips.txt"));
+            client_cfg.source_ips_file = Some(resolve_file_path(&client_cfg.source_ips_file.clone().unwrap_or_default(), "ips/source_ips.txt"));
+            
+            if client_cfg.cloudflare_api_token.is_some() || client_cfg.arvancloud_api_token.is_some() {
+                let c_cfg = client_cfg.clone();
+                let config_path_clone = config_path_main.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if c_cfg.cloudflare_api_token.is_some() || c_cfg.arvancloud_api_token.is_some() {
+                            if gather_and_provision_acme(c_cfg.cloudflare_api_token.as_deref(), c_cfg.arvancloud_api_token.as_deref(), c_cfg.tunnel_sni.as_ref(), c_cfg.web_server.as_ref(), c_cfg.copy_certs_to.as_ref()).await {
+                                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&config_path_clone) {
+                                    use std::io::Write;
+                                    let _ = f.write_all(b"\n# ACME Auto-Renewed Client\n");
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(86400)).await;
+                    }
+                });
+            }
+            
             run_client(client_cfg, token).await;
         } else {
             error!("❌ Neither [server] nor [client] configuration found!");
@@ -111,52 +165,88 @@ async fn main() {
     });
 
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        
-        if let Ok(new_content) = fs::read_to_string(&config_path) {
-            let mut hasher = DefaultHasher::new();
-            new_content.hash(&mut hasher);
-            let new_hash = hasher.finish();
-            if new_hash != last_hash {
-                last_hash = new_hash;
-                info!("🔄 Config file changed! Initiating Zero-Downtime Hot-Reload...");
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                if let Ok(new_content) = fs::read_to_string(&config_path) {
+                    let mut hasher = DefaultHasher::new();
+                    new_content.hash(&mut hasher);
+                    let new_hash = hasher.finish();
+                    if new_hash != last_hash {
+                        last_hash = new_hash;
+                        info!("🔄 Config file changed! Initiating Zero-Downtime Hot-Reload...");
 
-                if let Ok(mut new_config) = toml::from_str::<AppConfig>(&new_content) {
-                    if let Some(ref mut server_cfg) = new_config.server {
-                        server_cfg.tls_cert = resolve_cert_path(&server_cfg.tls_cert, "fullchain.pem");
-                        server_cfg.tls_key = resolve_cert_path(&server_cfg.tls_key, "privkey.pem");
-                    }
-                    let token_new = CancellationToken::new();
-                    let token_new_clone = token_new.clone();
+                        if let Ok(new_config) = toml::from_str::<AppConfig>(&new_content) {
+                            let token_new = CancellationToken::new();
+                            let token_new_clone = token_new.clone();
+                            let config_path_clone_reload = config_path.clone();
 
-                    let _ = tokio::spawn(async move {
-                        if let Some(server_cfg) = new_config.server {
-                            if server_cfg.cloudflare_api_token.is_some() {
-                                if crate::acme::needs_renewal(&server_cfg.tls_cert) {
-                                    if let Err(e) = crate::acme::provision_acme_cert(&server_cfg).await {
-                                        tracing::error!("❌ ACME Provisioning failed: {}", e);
+                            let _ = tokio::spawn(async move {
+                                if let Some(server_cfg) = new_config.server {
+                                    if server_cfg.cloudflare_api_token.is_some() || server_cfg.arvancloud_api_token.is_some() {
+                                        let cf = server_cfg.cloudflare_api_token.clone();
+                                        let arv = server_cfg.arvancloud_api_token.clone();
+                                        let sni = server_cfg.tunnel_sni.clone();
+                                        let proxy = server_cfg.web_server.clone();
+                                        let certs = server_cfg.copy_certs_to.clone();
+                                        tokio::spawn(async move {
+                                            if gather_and_provision_acme(cf.as_deref(), arv.as_deref(), sni.as_ref(), proxy.as_ref(), certs.as_ref()).await {
+                                                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&config_path_clone_reload) {
+                                                    use std::io::Write;
+                                                    let _ = f.write_all(b"\n# ACME Reloaded\n");
+                                                }
+                                            }
+                                        });
                                     }
+                                    run_server(server_cfg, token_new_clone).await;
+                                } else if let Some(mut client_cfg) = new_config.client {
+                                    client_cfg.clean_ip_file = Some(resolve_file_path(&client_cfg.clean_ip_file.clone().unwrap_or_default(), "ips/clean_ips.txt"));
+                                    client_cfg.source_ips_file = Some(resolve_file_path(&client_cfg.source_ips_file.clone().unwrap_or_default(), "ips/source_ips.txt"));
+                                    
+                                    if client_cfg.cloudflare_api_token.is_some() || client_cfg.arvancloud_api_token.is_some() {
+                                        let cf = client_cfg.cloudflare_api_token.clone();
+                                        let arv = client_cfg.arvancloud_api_token.clone();
+                                        let sni = client_cfg.tunnel_sni.clone();
+                                        let proxy = client_cfg.web_server.clone();
+                                        let certs = client_cfg.copy_certs_to.clone();
+                                        tokio::spawn(async move {
+                                            if gather_and_provision_acme(cf.as_deref(), arv.as_deref(), sni.as_ref(), proxy.as_ref(), certs.as_ref()).await {
+                                                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&config_path_clone_reload) {
+                                                    use std::io::Write;
+                                                    let _ = f.write_all(b"\n# ACME Reloaded\n");
+                                                }
+                                            }
+                                        });
+                                    }
+                                    run_client(client_cfg, token_new_clone).await;
+                                } else {
+                                    error!("❌ Neither [server] nor [client] configuration found!");
                                 }
-                            }
-                            run_server(server_cfg, token_new_clone).await;
-                        } else if let Some(client_cfg) = new_config.client {
-                            run_client(client_cfg, token_new_clone).await;
+                            });
+
+                            // Wait 100ms for the new listener to bind and be ready via SO_REUSEPORT
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+
+                            // Stop the old listener (active connections remain alive)
+                            current_cancel_token.cancel();
+                            
+                            current_cancel_token = token_new;
+                            info!("✅ Reload successful. Traffic is now routing through the new settings.");
                         } else {
-                            error!("❌ Neither [server] nor [client] configuration found!");
+                            error!("❌ TOML Parse Error. Ignoring changes...");
                         }
-                    });
-
-                    // Wait 100ms for the new listener to bind and be ready via SO_REUSEPORT
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    // Stop the old listener (active connections remain alive)
-                    current_cancel_token.cancel();
-                    
-                    current_cancel_token = token_new;
-                    info!("✅ Reload successful. Traffic is now routing through the new settings.");
-                } else {
-                    error!("❌ TOML Parse Error. Ignoring changes...");
+                    }
                 }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("🛑 Received signal (Ctrl+C). Initiating Graceful Shutdown...");
+                // Signal listeners to stop accepting new connections
+                current_cancel_token.cancel();
+                
+                info!("⏳ Waiting 3 seconds for active connections and pending operations to finish...");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                
+                info!("👋 Graceful Shutdown complete. Exiting GhostRPC.");
+                std::process::exit(0);
             }
         }
     }

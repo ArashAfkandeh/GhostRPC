@@ -51,6 +51,7 @@ if [ ! -f "Cargo.toml" ]; then
 fi
 
 RUSTFLAGS="-C target-cpu=generic" CARGO_TARGET_DIR=/root/target cargo build --release
+rm -f ./GhostRPC
 cp /root/target/release/GhostRPC ./GhostRPC
 echo "✅ Build Completed Successfully!"
 echo ""

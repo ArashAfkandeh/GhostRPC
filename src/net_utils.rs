@@ -88,24 +88,28 @@ pub fn create_reuseport_listener(addr_str: &str) -> std::io::Result<tokio::net::
     tokio::net::TcpListener::from_std(std_listener)
 }
 
-pub fn create_reuseport_udp_socket(addr_str: &str) -> std::io::Result<tokio::net::UdpSocket> {
-    use socket2::{Socket, Domain, Type, Protocol};
-    use std::net::SocketAddr;
-    
-    let addr: SocketAddr = addr_str.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    
-    socket.set_reuse_address(true)?;
-    
-    #[cfg(target_family = "unix")]
-    if let Err(e) = socket.set_reuse_port(true) {
-        tracing::warn!("Failed to set SO_REUSEPORT on UDP (Hot-reload might fail): {}", e);
+
+pub async fn send_h2_data(send_stream: &mut h2::SendStream<bytes::Bytes>, mut data: bytes::Bytes, end_of_stream: bool) -> Result<(), ()> {
+    if data.is_empty() {
+        if end_of_stream {
+            return send_stream.send_data(bytes::Bytes::new(), true).map_err(|_| ());
+        }
+        return Ok(());
     }
-    
-    socket.bind(&addr.into())?;
-    socket.set_nonblocking(true)?;
-    
-    let std_socket: std::net::UdpSocket = socket.into();
-    tokio::net::UdpSocket::from_std(std_socket)
+
+    while !data.is_empty() {
+        send_stream.reserve_capacity(data.len());
+        if send_stream.capacity() == 0 {
+            if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await {
+                return Err(());
+            }
+        }
+        let to_send = std::cmp::min(send_stream.capacity(), data.len());
+        let chunk = data.split_to(to_send);
+        let is_last = data.is_empty() && end_of_stream;
+        if send_stream.send_data(chunk, is_last).is_err() {
+            return Err(());
+        }
+    }
+    Ok(())
 }
