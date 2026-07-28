@@ -88,14 +88,32 @@ async fn connect_h2_node(node: &ActiveNode, clean_ips: &[String], tls_connector:
     let tls_stream = tls_connector.connect(domain, tcp).await.map_err(|e| e.to_string())?;
     
     // Use aggressive HTTP/2 flow control windows (Default 65KB is too slow for WAN)
-    let (client, conn) = h2::client::Builder::new()
-        .initial_window_size(33_554_432) // 32 MB Stream Window
-        .initial_connection_window_size(134_217_728) // 128 MB Connection Window
+    let (client, mut conn) = h2::client::Builder::new()
+        .initial_window_size(2_097_152) // 2 MB Stream Window
+        .initial_connection_window_size(4_194_304) // 4 MB Connection Window
         .max_frame_size(1_048_576) // 1 MB max frame
         .handshake(tls_stream).await.map_err(|e| e.to_string())?;
 
+    let mut ping_pong = conn.ping_pong().unwrap();
     tokio::spawn(async move {
-        if let Err(e) = conn.await { debug!("H2 background connection closed: {:?}", e); }
+        let ping_loop = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                match tokio::time::timeout(std::time::Duration::from_secs(2), ping_pong.ping(h2::Ping::opaque())).await {
+                    Ok(Ok(_)) => {},
+                    _ => {
+                        tracing::warn!("H2 Ping failed or timed out. Dropping connection.");
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            res = conn => {
+                if let Err(e) = res { tracing::debug!("H2 background connection closed: {:?}", e); }
+            }
+            _ = ping_loop => {}
+        }
     });
     Ok(client)
 }
@@ -393,7 +411,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                     }
                                     
                                     if ready_client.is_none() {
-                                        tracing::error!("[Conn #{}] All pool slots are disconnected! Connection dropped.", c_id);
+                                        tracing::warn!("[Conn #{}] All pool slots are disconnected! Connection dropped.", c_id);
                                         return;
                                     }
                                     
@@ -445,7 +463,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     final_response = Some(res);
                                                     break;
                                                 }
-                                                tracing::error!("[Conn #{}] Tunnel failed! Remote server {} returned HTTP {}", c_id, target_remote.sni, res.status());
+                                                tracing::warn!("[Conn #{}] Tunnel failed! Remote server {} returned HTTP {}", c_id, target_remote.sni, res.status());
                                                 let mut slot = pool_slot.lock().await;
                                                 slot.ewma_latency += 5000.0;
                                                 failed_snis.insert(target_remote.sni.clone());
@@ -470,7 +488,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                 }
                                 
                                 if final_send_stream.is_none() {
-                                    tracing::error!("[Conn #{}] All tunnel attempts failed.", c_id);
+                                    tracing::warn!("[Conn #{}] All tunnel attempts failed.", c_id);
                                     return;
                                 }
                                 

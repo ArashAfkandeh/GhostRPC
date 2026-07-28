@@ -113,11 +113,13 @@ function update_app() {
     if [ -f "/tmp/GhostRPC.tar.gz" ]; then
         echo -e "${CYAN}Extracting update...${NC}"
         mkdir -p /tmp/GhostRPC_update
-        tar -xzvf /tmp/GhostRPC.tar.gz -C /tmp/GhostRPC_update
+        tar -xzvf /tmp/GhostRPC.tar.gz -C /tmp/GhostRPC_update --strip-components=1
         
-        echo -e "${CYAN}Replacing binary...${NC}"
+        echo -e "${CYAN}Replacing binary and scripts...${NC}"
         cp /tmp/GhostRPC_update/GhostRPC $BIN_PATH
         chmod +x $BIN_PATH
+        cp /tmp/GhostRPC_update/ghostrpc.sh /root/GhostRPC/ghostrpc.sh
+        chmod +x /root/GhostRPC/ghostrpc.sh
         
         rm -rf /tmp/GhostRPC.tar.gz /tmp/GhostRPC_update
         

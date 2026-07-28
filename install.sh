@@ -10,7 +10,6 @@ echo "[*] Installing required dependencies..."
 sudo apt-get update -y
 sudo apt-get install -y curl wget tar
 
-# توجه: لینک زیر را با لینک گیتهاب ریپازیتوری خود جایگزین کنید
 GITHUB_REPO="https://github.com/ArashAfkandeh/GhostRPC/releases/latest/download/GhostRPC.tar.gz"
 
 echo "[*] Downloading GhostRPC from GitHub..."
@@ -23,7 +22,7 @@ fi
 
 echo "[*] Extracting GhostRPC..."
 mkdir -p /root/GhostRPC
-sudo tar -xzvf /root/GhostRPC.tar.gz -C /root/
+sudo tar -xzvf /root/GhostRPC.tar.gz -C /root/GhostRPC --strip-components=1
 
 echo ""
 echo "Select installation mode:"

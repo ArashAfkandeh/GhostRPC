@@ -12,7 +12,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{OnceLock, RwLock};
 
 #[derive(Debug)]
 struct WildcardResolver {
@@ -53,6 +54,13 @@ impl rustls::server::ResolvesServerCert for WildcardResolver {
 // ==========================================
 // 6. SERVER MODE
 // ==========================================
+
+static DEAD_TARGETS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+
+fn get_dead_targets() -> &'static RwLock<HashSet<String>> {
+    DEAD_TARGETS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
 pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     let mut resolver = WildcardResolver::new();
     let mut loaded_certs = 0;
@@ -117,6 +125,42 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     }
     let local_web_server_map = Arc::new(web_server_map);
 
+    let mut unique_targets = HashSet::new();
+    for target in local_direct_route.sni_rules.values() {
+        unique_targets.insert(target.clone());
+    }
+    if let Some(target) = &local_direct_route.default_upstream {
+        unique_targets.insert(target.clone());
+    }
+
+    let cancel_hc = cancel_token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_hc.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            }
+            let mut targets_to_check = unique_targets.clone();
+            {
+                let dead = get_dead_targets().read().unwrap();
+                for t in dead.iter() {
+                    targets_to_check.insert(t.clone());
+                }
+            }
+            
+            let mut current_dead = HashSet::new();
+            for target in &targets_to_check {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(target)).await {
+                    Ok(Ok(_)) => {}, // target is up
+                    _ => {
+                        current_dead.insert(target.clone());
+                    }
+                }
+            }
+            *get_dead_targets().write().unwrap() = current_dead;
+        }
+    });
+
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -174,6 +218,10 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                         };
 
                         if let Some(target) = target_up {
+                            if get_dead_targets().read().unwrap().contains(&target) {
+                                return; // Circuit Breaker: Target is dead, drop instantly without overhead
+                            }
+
                             tracing::debug!("🔄 SNI Routing triggered for {:?} -> {}", extracted_sni, target);
                             match tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(&target)).await {
                                 Ok(Ok(mut upstream_tcp)) => {
@@ -187,8 +235,10 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                     
                                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut upstream_tcp).await;
                                 }
-                                Ok(Err(e)) => tracing::error!("Failed to connect to SNI target {}: {}", target, e),
-                                Err(_) => tracing::error!("Connection to SNI target {} timed out", target),
+                                Ok(Err(_)) | Err(_) => {
+                                    // Soft fallback if it fails before health check detects it
+                                    // Just return, no sleep, no warn log spam
+                                }
                             }
                             return;
                         }
@@ -213,8 +263,8 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                             }
                         }
                         let mut h2 = match h2::server::Builder::new()
-                            .initial_window_size(33_554_432) // 32 MB Stream Window
-                            .initial_connection_window_size(134_217_728) // 128 MB Connection Window
+                            .initial_window_size(2_097_152) // 2 MB Stream Window
+                            .initial_connection_window_size(4_194_304) // 4 MB Connection Window
                             .max_frame_size(1_048_576) // 1 MB max frame
                             .handshake(tls_stream).await { Ok(h) => h, Err(e) => { tracing::debug!("H2 Handshake failed: {:?}", e); return } };
 
@@ -324,15 +374,21 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                 }
                                 
                                 if tcp_stream.is_none() {
+                                    if get_dead_targets().read().unwrap().contains(&target) {
+                                        // Circuit Breaker: Target is dead, drop instantly without Tarpit
+                                        let _ = respond.send_response(http::Response::builder().status(StatusCode::BAD_GATEWAY).body(()).unwrap(), true);
+                                        return;
+                                    }
+
                                     match tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(&target)).await {
                                         Ok(Ok(tcp)) => {
                                             tracing::debug!("✅ Successfully connected to target: {}", target);
                                             tcp_stream = Some(tcp);
                                         }
                                         _ => {
-                                            tracing::error!("❌ Failed to connect to target: {}", target);
+                                            tracing::warn!("❌ Failed to connect to target: {}", target);
+                                            get_dead_targets().write().unwrap().insert(target.clone());
                                             let _ = respond.send_response(http::Response::builder().status(StatusCode::BAD_GATEWAY).body(()).unwrap(), true);
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                             return;
                                         }
                                     }
