@@ -149,6 +149,8 @@ function uninstall_app() {
         rm -f /usr/local/bin/ghostrpc
         
         echo -e "${GREEN}GhostRPC has been successfully uninstalled.${NC}"
+        echo -e "${CYAN}You can reinstall the program with the following command:${NC}"
+        echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/ArashAfkandeh/GhostRPC/main/install.sh | sudo bash${NC}"
         exit 0
     else
         echo -e "${YELLOW}Uninstall cancelled.${NC}"

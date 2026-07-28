@@ -37,7 +37,11 @@ curl -sSL https://raw.githubusercontent.com/ArashAfkandeh/GhostRPC/main/install.
 ```bash
 ghostrpc
 ```
-با استفاده از این منوی جذاب و گرافیکی می‌توانید تونل را استارت، استاپ، ری‌استارت، آپدیت و یا حذف کنید!
+با استفاده از این منوی جذاب و گرافیکی (CLI) می‌توانید وضعیت سرویس را مانیتور کنید، تونل را استارت، استاپ، ری‌استارت، آپدیت و یا حتی به طور کامل از سرور حذف (Uninstall) کنید!
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ArashAfkandeh/GhostRPC/main/cli_menu.png" alt="GhostRPC CLI Menu" width="500">
+</p>
 
 ---
 
