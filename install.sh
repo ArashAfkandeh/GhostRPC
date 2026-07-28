@@ -28,7 +28,7 @@ echo ""
 echo "Select installation mode:"
 echo "1) Server Mode"
 echo "2) Client Mode"
-read -p "Enter your choice (1 or 2): " mode_choice
+read -p "Enter your choice (1 or 2): " mode_choice </dev/tty
 
 SERVICE_FILE="/etc/systemd/system/GhostRPC.service"
 
