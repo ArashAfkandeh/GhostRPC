@@ -148,16 +148,32 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                 }
             }
             
-            let mut current_dead = HashSet::new();
+            let mut recovered_targets = Vec::new();
+            let mut newly_dead_static = Vec::new();
+            
             for target in &targets_to_check {
                 match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(target)).await {
-                    Ok(Ok(_)) => {}, // target is up
+                    Ok(Ok(_)) => {
+                        // Target is UP
+                        recovered_targets.push(target.clone());
+                    },
                     _ => {
-                        current_dead.insert(target.clone());
+                        // Target is DOWN. Ensure static targets are tracked.
+                        if unique_targets.contains(target) {
+                            newly_dead_static.push(target.clone());
+                        }
                     }
                 }
             }
-            *get_dead_targets().write().unwrap() = current_dead;
+            
+            // Safely apply changes without erasing dynamically added targets
+            let mut dead_guard = get_dead_targets().write().unwrap();
+            for t in recovered_targets {
+                dead_guard.remove(&t);
+            }
+            for t in newly_dead_static {
+                dead_guard.insert(t);
+            }
         }
     });
 
@@ -368,14 +384,22 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                             tracing::debug!("✅ Successfully connected to local fallback target (IPv6): {}", local_v6);
                                             tcp_stream = Some(tcp);
                                         } else {
-                                            tracing::debug!("⚠️ Local targets (IPv4/IPv6) not available, falling back to original: {}", target);
+                                            tracing::debug!("⚠️ Local targets (IPv4/IPv6) not available for {}", target);
                                         }
                                     }
                                 }
                                 
                                 if tcp_stream.is_none() {
+                                    if try_local {
+                                        tracing::warn!("❌ Failed to connect to local target for {}", target);
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                        let _ = respond.send_response(http::Response::builder().status(StatusCode::BAD_GATEWAY).body(()).unwrap(), true);
+                                        return;
+                                    }
+
                                     if get_dead_targets().read().unwrap().contains(&target) {
-                                        // Circuit Breaker: Target is dead, drop instantly without Tarpit
+                                        // Circuit Breaker: Target is dead. Tarpit to prevent Rapid Reset retry storm
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                         let _ = respond.send_response(http::Response::builder().status(StatusCode::BAD_GATEWAY).body(()).unwrap(), true);
                                         return;
                                     }
@@ -388,6 +412,8 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                         _ => {
                                             tracing::warn!("❌ Failed to connect to target: {}", target);
                                             get_dead_targets().write().unwrap().insert(target.clone());
+                                            // Tarpit to throttle the client
+                                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                             let _ = respond.send_response(http::Response::builder().status(StatusCode::BAD_GATEWAY).body(()).unwrap(), true);
                                             return;
                                         }
