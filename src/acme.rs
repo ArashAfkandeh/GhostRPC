@@ -1,4 +1,3 @@
-
 use rcgen::{CertificateParams, KeyPair};
 use std::time::Duration;
 use tokio::time::sleep;

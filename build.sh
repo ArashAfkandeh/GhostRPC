@@ -2,6 +2,7 @@
 # GhostRPC Auto Build Script
 
 set -e
+export DEBIAN_FRONTEND=noninteractive
 
 echo "==========================================="
 echo "   GhostRPC Auto Build Script              "
@@ -13,15 +14,35 @@ cd "$SCRIPT_DIR"
 
 # 1. Update and install basic dependencies
 echo "[*] Checking and installing basic build dependencies..."
+
+NEEDS_RUST=false
+if ! command -v cargo &> /dev/null; then
+    NEEDS_RUST=true
+fi
+
 if command -v apt-get &> /dev/null; then
-    sudo apt-get update -y
-    sudo apt-get install -y curl build-essential pkg-config libssl-dev
+    MISSING=""
+    for pkg in curl build-essential pkg-config libssl-dev; do
+        if ! dpkg -l | grep -qw "^ii  $pkg"; then
+            MISSING="$MISSING $pkg"
+        fi
+    done
+    
+    if [ -n "$MISSING" ] || [ "$NEEDS_RUST" = true ]; then
+        echo "[*] Installing missing dependencies... (apt update)"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -yq
+        if [ -n "$MISSING" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq $MISSING
+        fi
+    else
+        echo "[*] All apt dependencies are already installed."
+    fi
 elif command -v yum &> /dev/null; then
-    sudo yum update -y
+    if [ "$NEEDS_RUST" = true ]; then sudo yum update -y; fi
     sudo yum groupinstall -y "Development Tools"
     sudo yum install -y curl openssl-devel
 elif command -v dnf &> /dev/null; then
-    sudo dnf update -y
+    if [ "$NEEDS_RUST" = true ]; then sudo dnf update -y; fi
     sudo dnf groupinstall -y "Development Tools"
     sudo dnf install -y curl openssl-devel
 elif command -v pacman &> /dev/null; then

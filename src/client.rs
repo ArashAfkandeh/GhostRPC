@@ -1,23 +1,23 @@
 use crate::config::ClientConfig;
 
 use crate::net_utils::{enable_tcp_keepalive, get_random_headers};
-use crate::routing::extract_sni;
 
 use bytes::{Bytes, BytesMut};
 use http::{Method, Request};
 use std::{
-    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     sync::Mutex,
 };
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-
 
 pub struct ConnectionState {
     pub client: Option<h2::client::SendRequest<Bytes>>,
@@ -27,7 +27,11 @@ pub struct ConnectionState {
 
 impl Default for ConnectionState {
     fn default() -> Self {
-        Self { client: None, consecutive_errors: 0, ewma_latency: 500.0 }
+        Self {
+            client: None,
+            consecutive_errors: 0,
+            ewma_latency: 500.0,
+        }
     }
 }
 
@@ -38,33 +42,40 @@ pub struct ActiveNode {
     pub share_sni: u32,
 }
 
-async fn connect_h2_node(node: &ActiveNode, clean_ips: &[String], tls_connector: &TlsConnector) -> Result<h2::client::SendRequest<Bytes>, String> {
+async fn connect_h2_node(
+    node: &ActiveNode,
+    clean_ips: &[String],
+    tls_connector: &TlsConnector,
+) -> Result<h2::client::SendRequest<Bytes>, String> {
     let (sni_host, sni_port) = if let Some(idx) = node.sni.rfind(':') {
-        (&node.sni[..idx], &node.sni[idx+1..])
+        (&node.sni[..idx], &node.sni[idx + 1..])
     } else {
         (node.sni.as_str(), "443")
     };
 
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut connect_tasks = FuturesUnordered::new();
-    
+
     for ip in clean_ips {
         let addr_str = if ip.contains(':') && !ip.starts_with('[') {
-             if ip.split(':').count() > 2 {
-                 format!("[{}]:{}", ip, sni_port) // IPv6
-             } else {
-                 ip.to_string() // User provided IPv4:Port in clean_ip? Unlikely but supported
-             }
+            if ip.split(':').count() > 2 {
+                format!("[{}]:{}", ip, sni_port) // IPv6
+            } else {
+                ip.to_string() // User provided IPv4:Port in clean_ip? Unlikely but supported
+            }
         } else {
-             format!("{}:{}", ip, sni_port)
+            format!("{}:{}", ip, sni_port)
         };
-        
+
         connect_tasks.push(async move {
-            let addrs = tokio::net::lookup_host(&addr_str).await.map_err(|e| e.to_string())?.collect::<Vec<_>>();
+            let addrs = tokio::net::lookup_host(&addr_str)
+                .await
+                .map_err(|e| e.to_string())?
+                .collect::<Vec<_>>();
             for addr in addrs {
-                 if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(addr)).await {
-                     return Ok::<_, String>(stream);
-                 }
+                if let Ok(stream) = crate::anti_loop::safe_connect(addr, std::time::Duration::from_secs(5)).await {
+                    return Ok::<_, String>(stream);
+                }
             }
             Err::<_, String>("Failed".into())
         });
@@ -84,14 +95,19 @@ async fn connect_h2_node(node: &ActiveNode, clean_ips: &[String], tls_connector:
     crate::net_utils::tune_socket_buffers(&tcp);
     enable_tcp_keepalive(&tcp);
 
-    let domain = rustls::pki_types::ServerName::try_from(sni_host).map_err(|e| e.to_string())?.to_owned();
-    let tls_stream = tls_connector.connect(domain, tcp).await.map_err(|e| e.to_string())?;
-    
+    let domain = rustls::pki_types::ServerName::try_from(sni_host)
+        .map_err(|e| e.to_string())?
+        .to_owned();
+    let tls_stream = tls_connector
+        .connect(domain, tcp)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Use aggressive HTTP/2 flow control windows (Default 65KB is too slow for WAN)
     let (client, mut conn) = h2::client::Builder::new()
-        .initial_window_size(2_097_152) // 2 MB Stream Window
-        .initial_connection_window_size(4_194_304) // 4 MB Connection Window
-        .max_frame_size(1_048_576) // 1 MB max frame
+        .initial_window_size(8_388_608) // 8 MB Stream Window (High BDP throughput)
+        .initial_connection_window_size(1_073_741_824) // 1 GB Connection Window
+        .max_frame_size(65_535) // 64 KB max frame (Prevents HoL blocking on lossy networks)
         .handshake(tls_stream).await.map_err(|e| e.to_string())?;
 
     let mut ping_pong = conn.ping_pong().unwrap();
@@ -99,8 +115,13 @@ async fn connect_h2_node(node: &ActiveNode, clean_ips: &[String], tls_connector:
         let ping_loop = async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                match tokio::time::timeout(std::time::Duration::from_secs(2), ping_pong.ping(h2::Ping::opaque())).await {
-                    Ok(Ok(_)) => {},
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    ping_pong.ping(h2::Ping::opaque()),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
                     _ => {
                         tracing::warn!("H2 Ping failed or timed out. Dropping connection.");
                         break;
@@ -118,7 +139,16 @@ async fn connect_h2_node(node: &ActiveNode, clean_ips: &[String], tls_connector:
     Ok(client)
 }
 
-pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
+static CLIENT_DEAD_TARGETS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+pub fn get_client_dead_targets() -> &'static std::sync::RwLock<std::collections::HashSet<String>> {
+    CLIENT_DEAD_TARGETS.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+}
+
+pub async fn run_client(
+    cfg: ClientConfig,
+    cancel_token: CancellationToken,
+) {
     let mut flat_remotes = Vec::new();
     for loc in cfg.remotes.iter() {
         let sharing = loc.share_sni.unwrap_or(0);
@@ -131,13 +161,12 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
         }
     }
     if flat_remotes.is_empty() {
-        error!("No remote servers defined!");
-        return;
+        tracing::info!("No remote servers defined in client config. GhostRPC tunnel will not be established.");
     }
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    
+
     let mut tls_config_h2 = rustls::ClientConfig::builder()
         .with_root_certificates(root_store.clone())
         .with_no_client_auth();
@@ -147,98 +176,134 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     let pool_per_node = cfg.pool_size_per_node.unwrap_or(16);
     let total_pool_size = flat_remotes.len() * pool_per_node;
 
-    info!("Initializing Distributed Pool ({} nodes x {} conns = {} total streams)...", flat_remotes.len(), pool_per_node, total_pool_size);
+    if !flat_remotes.is_empty() {
+        info!(
+            "Initializing Distributed Pool ({} nodes x {} conns = {} total streams)...",
+            flat_remotes.len(),
+            pool_per_node,
+            total_pool_size
+        );
+    }
 
     let mut pool: Vec<(Arc<Mutex<ConnectionState>>, ActiveNode)> = Vec::new();
     for _ in 0..pool_per_node {
         for remote in &flat_remotes {
-            pool.push((Arc::new(Mutex::new(ConnectionState::default())), remote.clone()));
+            pool.push((
+                Arc::new(Mutex::new(ConnectionState::default())),
+                remote.clone(),
+            ));
         }
     }
     let pool = Arc::new(pool);
 
     // Pre-load clean IPs from file BEFORE starting anything
-    let clean_ip_file = cfg.clean_ip_file.clone().unwrap_or_else(|| "ips/clean_ips.txt".to_string());
-    let source_ips_file = cfg.source_ips_file.clone().unwrap_or_else(|| "ips/source_ips.txt".to_string());
+    let clean_ip_file = cfg
+        .clean_ip_file
+        .clone()
+        .unwrap_or_else(|| "ips/clean_ips.txt".to_string());
+    let source_ips_file = cfg
+        .source_ips_file
+        .clone()
+        .unwrap_or_else(|| "ips/source_ips.txt".to_string());
     let check_interval_minutes = cfg.check_interval_minutes.unwrap_or(60);
     let max_ping_ms = cfg.max_ping_ms.unwrap_or(150);
 
-    let initial_ips: Vec<String> = if let Ok(content) = tokio::fs::read_to_string(&clean_ip_file).await {
-        content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-    } else {
-        Vec::new()
-    };
+    let initial_ips: Vec<String> =
+        if let Ok(content) = tokio::fs::read_to_string(&clean_ip_file).await {
+            content
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let clean_ips_global = Arc::new(tokio::sync::RwLock::new(initial_ips));
 
     // Start IP Scanner (background periodic refresh)
-    let scanner = crate::scanner::Scanner::new(
-        clean_ip_file,
-        source_ips_file,
-        check_interval_minutes,
-        max_ping_ms,
-        clean_ips_global.clone(),
-        cfg.remotes.clone(),
-        tls_connector.clone(),
-    );
-    scanner.start();
-
-    // Eager Pool Maintainer (Background Connect)
-    for (slot_arc, remote) in pool.iter() {
-        let slot = slot_arc.clone();
-        let remote = remote.clone();
-        let tls = tls_connector.clone();
-        let token = cancel_token.clone();
-        let clean_ips = clean_ips_global.clone();
-        
-        tokio::spawn(async move {
-            let mut backoff_ms: u64 = 500;
-            let max_backoff_ms: u64 = 30000;
-            
-            loop {
-                if token.is_cancelled() { break; }
-                
-                let is_none = slot.lock().await.client.is_none();
-                if is_none {
-                    let start_time = tokio::time::Instant::now();
-                    let current_ips = clean_ips.read().await.clone();
-                    if !current_ips.is_empty() {
-                        if let Ok(new_client) = connect_h2_node(&remote, &current_ips, &tls).await {
-                            let mut guard = slot.lock().await;
-                            guard.client = Some(new_client);
-                            guard.consecutive_errors = 0;
-                            guard.ewma_latency = start_time.elapsed().as_millis() as f64;
-                            tracing::trace!("🔥 Pool Maintainer: Warmed up connection to {} ({}ms)", remote.sni, guard.ewma_latency);
-                            
-                            // Reset backoff on success
-                            backoff_ms = 500;
-                        } else {
-                            // Exponential Backoff with Jitter (Enterprise Grade)
-                            backoff_ms = std::cmp::min(max_backoff_ms, (backoff_ms as f64 * 1.5) as u64);
-                            let jitter = (rand::random::<u64>() % 1000) + 100;
-                            backoff_ms = std::cmp::min(max_backoff_ms, backoff_ms + jitter);
-                            tracing::debug!("⚠️ Pool Maintainer: Failed to connect to {}, backing off for {}ms", remote.sni, backoff_ms);
-                        }
-                    }
-                } else {
-                    // Reset backoff if we are connected
-                    backoff_ms = 500;
-                }
-                
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                    _ = token.cancelled() => break,
-                }
-            }
-        });
+    if !flat_remotes.is_empty() {
+        let scanner = crate::scanner::Scanner::new(
+            clean_ip_file,
+            source_ips_file,
+            check_interval_minutes,
+            max_ping_ms,
+            clean_ips_global.clone(),
+            cfg.remotes.clone(),
+            tls_connector.clone(),
+        );
+        scanner.start(cancel_token.clone());
     }
 
-    // Warmup: Wait for at least one pool connection before accepting user traffic
-    {
+    // Eager Pool Maintainer (Background Connect)
+    if !flat_remotes.is_empty() {
+        for (slot_arc, remote) in pool.iter() {
+            let slot = slot_arc.clone();
+            let remote = remote.clone();
+            let tls = tls_connector.clone();
+            let token = cancel_token.clone();
+            let clean_ips = clean_ips_global.clone();
+
+            tokio::spawn(async move {
+                let mut backoff_ms: u64 = 500;
+                let max_backoff_ms: u64 = 30000;
+
+                loop {
+                    if token.is_cancelled() {
+                        break;
+                    }
+
+                    let is_none = slot.lock().await.client.is_none();
+                    if is_none {
+                        let start_time = tokio::time::Instant::now();
+                        let current_ips = clean_ips.read().await.clone();
+                        if !current_ips.is_empty() {
+                            if let Ok(new_client) = connect_h2_node(&remote, &current_ips, &tls).await {
+                                let mut guard = slot.lock().await;
+                                guard.client = Some(new_client);
+                                guard.consecutive_errors = 0;
+                                guard.ewma_latency = start_time.elapsed().as_millis() as f64;
+                                tracing::trace!(
+                                    "🔥 Pool Maintainer: Warmed up connection to {} ({}ms)",
+                                    remote.sni,
+                                    guard.ewma_latency
+                                );
+
+                                // Reset backoff on success
+                                backoff_ms = 500;
+                            } else {
+                                // Exponential Backoff with Jitter (Enterprise Grade)
+                                backoff_ms =
+                                    std::cmp::min(max_backoff_ms, (backoff_ms as f64 * 1.5) as u64);
+                                let jitter = (rand::random::<u64>() % 1000) + 100;
+                                backoff_ms = std::cmp::min(max_backoff_ms, backoff_ms + jitter);
+                                tracing::debug!(
+                                    "⚠️ Pool Maintainer: Failed to connect to {}, backing off for {}ms",
+                                    remote.sni,
+                                    backoff_ms
+                                );
+                            }
+                        }
+                    } else {
+                        // Reset backoff if we are connected
+                        backoff_ms = 500;
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                        _ = token.cancelled() => break,
+                    }
+                }
+            });
+        }
+
+        // Warmup: Wait for at least one pool connection before accepting user traffic
         let warmup_start = tokio::time::Instant::now();
         let warmup_timeout = Duration::from_secs(30);
         loop {
-            if cancel_token.is_cancelled() { return; }
+            if cancel_token.is_cancelled() {
+                return;
+            }
             let mut has_ready = false;
             for (slot_arc, _) in pool.iter() {
                 let guard = slot_arc.lock().await;
@@ -248,7 +313,10 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                 }
             }
             if has_ready {
-                info!("✅ Pool warmup complete in {}ms, starting listeners...", warmup_start.elapsed().as_millis());
+                info!(
+                    "✅ Pool warmup complete in {}ms, starting listeners...",
+                    warmup_start.elapsed().as_millis()
+                );
                 break;
             }
             if warmup_start.elapsed() > warmup_timeout {
@@ -261,9 +329,113 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
 
     let conn_counter = Arc::new(AtomicUsize::new(0));
 
+    // NEW: Load Certificates for Client-Side Web Server Multiplexing
+    let mut acceptor_opt = None;
+    let mut web_server_routes = Vec::new();
+    if let Some(ws_configs) = &cfg.web_server {
+        for ws in ws_configs {
+            tracing::info!(
+                "🚀 Admin Panel / Web Server configured for domain: {}",
+                ws.domain
+            );
+            tracing::info!("   👉 Access the panel at: https://{}/panel", ws.domain);
+        }
+        if !ws_configs.is_empty() {
+            web_server_routes = ws_configs.clone();
+            let mut resolver = rustls::server::ResolvesServerCertUsingSni::new();
+            let mut loaded_certs = 0;
+            let exe_dir = std::env::current_exe()
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                .parent()
+                .unwrap_or(std::path::Path::new(""))
+                .to_path_buf();
+            let certs_dir = exe_dir.join("certs");
+
+            if certs_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(certs_dir) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            let domain = entry.file_name().to_string_lossy().to_string();
+                            let cert_path = entry.path().join("fullchain.pem");
+                            let key_path = entry.path().join("privkey.pem");
+                            if cert_path.exists() && key_path.exists() {
+                                if let Ok(cert_file) = std::fs::File::open(&cert_path) {
+                                    if let Ok(key_file) = std::fs::File::open(&key_path) {
+                                        let certs: Vec<_> = rustls_pemfile::certs(
+                                            &mut std::io::BufReader::new(cert_file),
+                                        )
+                                        .map(|r| r.unwrap())
+                                        .collect();
+                                        if let Ok(Some(key)) = rustls_pemfile::private_key(
+                                            &mut std::io::BufReader::new(key_file),
+                                        ) {
+                                            if let Ok(sign_key) =
+                                                rustls::crypto::ring::sign::any_supported_type(&key)
+                                            {
+                                                let certified_key = rustls::sign::CertifiedKey::new(
+                                                    certs, sign_key,
+                                                );
+                                                let _ =
+                                                    resolver.add(&domain, certified_key.clone());
+                                                let _ = resolver
+                                                    .add(&format!("*.{}", domain), certified_key.clone());
+                                                for ws in &web_server_routes {
+                                                    if ws.domain.ends_with(&domain) {
+                                                        let _ = resolver.add(&ws.domain, certified_key.clone());
+                                                    }
+                                                }
+                                                loaded_certs += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if loaded_certs == 0 {
+                tracing::warn!(
+                    "⚠️ هیچ گواهینامه‌ای در مسیر certs پیدا نشد! ارتباطات TLS کلاینت ممکن است با خطا مواجه شوند."
+                );
+            }
+
+            let mut tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(std::sync::Arc::new(resolver));
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            acceptor_opt = Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                tls_config,
+            )));
+        }
+    }
+    let local_acceptor_global = std::sync::Arc::new(acceptor_opt);
+    let local_ws_routes_global = std::sync::Arc::new(web_server_routes);
+
     let mut mapped_routes = std::collections::HashMap::new();
     for loc in cfg.remotes.iter() {
-        crate::routing::parse_port_mappings(&loc.port_mappings, Some(&loc.location), &mut mapped_routes);
+        crate::routing::parse_port_mappings(
+            &loc.port_mappings,
+            Some(&loc.location),
+            &mut mapped_routes,
+        );
+    }
+
+    if cfg.web_server.is_some() {
+        if !mapped_routes.contains_key("0.0.0.0:443") && !mapped_routes.contains_key("[::]:443") {
+            mapped_routes.insert("0.0.0.0:443".to_string(), crate::config::Route {
+                default_upstream: None,
+                target_locations: std::collections::HashMap::new(),
+                sni_rules: std::collections::HashMap::new(),
+            });
+        }
+        if !mapped_routes.contains_key("0.0.0.0:80") && !mapped_routes.contains_key("[::]:80") {
+            mapped_routes.insert("0.0.0.0:80".to_string(), crate::config::Route {
+                default_upstream: None,
+                target_locations: std::collections::HashMap::new(),
+                sni_rules: std::collections::HashMap::new(),
+            });
+        }
     }
     for (local_bind, route_table) in &mapped_routes {
         if let Some(def) = &route_table.default_upstream {
@@ -272,11 +444,33 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
         for (sni, up) in &route_table.sni_rules {
             tracing::debug!("Mapping {} (SNI: {}) -> Upstream: {}", local_bind, sni, up);
         }
-    }    for (local_bind, route_table) in mapped_routes {
-        let listener = match crate::net_utils::create_reuseport_listener(&local_bind) {
-            Ok(l) => l, Err(e) => { error!("Failed to bind {}: {}", local_bind, e); continue; }
+    }
+    for (local_bind, route_table) in mapped_routes {
+        let mut listener_opt = None;
+        for i in 0..10 {
+            match crate::net_utils::create_reuseport_listener(&local_bind) {
+                Ok(l) => {
+                    listener_opt = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ Failed to bind {} (attempt {}/10): {}. Retrying in 200ms...", local_bind, i + 1, e);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        let listener = match listener_opt {
+            Some(l) => l,
+            None => {
+                error!("❌ FATAL: Could not bind {} after 10 attempts.", local_bind);
+                continue;
+            }
         };
-        info!("🚀 Listener active on {} with {} SNI rules", local_bind, route_table.sni_rules.len());
+        info!(
+            "🚀 Listener active on {} with {} SNI rules",
+            local_bind,
+            route_table.sni_rules.len()
+        );
 
         let cfg_clone = cfg.clone();
 
@@ -284,6 +478,9 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
 
         let counter_clone = conn_counter.clone();
         let token = cancel_token.clone();
+
+        let local_acceptor = local_acceptor_global.clone();
+        let local_ws_routes = local_ws_routes_global.clone();
 
         tokio::spawn(async move {
             loop {
@@ -294,6 +491,10 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                     }
                     accept_res = listener.accept() => {
                         if let Ok((mut local_tcp, peer)) = accept_res {
+                            if crate::anti_loop::is_loop(&peer) {
+                                crate::net_utils::log_rate_limited(&format!("anti_loop_{}", peer), "🛑 Anti-Loop Firewall: Dropped self-loop connection in client main.");
+                                continue;
+                            }
                             let _ = local_tcp.set_nodelay(true);
                             crate::net_utils::tune_socket_buffers(&local_tcp);
                             enable_tcp_keepalive(&local_tcp);
@@ -302,36 +503,111 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                             let route_table = route_table.clone();
                             let pool_clone = pool_clone.clone();
                             let cfg_inner = cfg_clone.clone();
-
+                            let acceptor_clone = local_acceptor.clone();
+                            let ws_routes_clone = local_ws_routes.clone();
 
                             tokio::spawn(async move {
                                 let mut extracted_sni = None;
-                                let mut initial_buf = [0u8; 2048];
+                                let mut initial_buf = [0u8; 8192];
                                 let mut initial_len = 0;
                                 let _ = tokio::time::timeout(Duration::from_millis(500), async {
                                     loop {
-                                        if initial_len >= 2048 { break; }
+                                        if initial_len >= 8192 { break; }
                                         let n = match local_tcp.read(&mut initial_buf[initial_len..]).await {
                                             Ok(n) if n > 0 => n,
                                             _ => break,
                                         };
                                         initial_len += n;
 
-                                        if initial_buf[0] != 0x16 { break; }
-                                        if let Some(sni) = extract_sni(&initial_buf[..initial_len]) {
-                                            extracted_sni = Some(sni);
-                                            break;
-                                        }
-
-                                        if initial_len >= 5 {
-                                            let record_len = ((initial_buf[3] as usize) << 8) | (initial_buf[4] as usize);
-                                            if initial_len >= 5 + record_len {
-                                                break; 
+                                        if initial_buf[0] == 0x16 {
+                                            if let Some(sni) = crate::routing::extract_sni(&initial_buf[..initial_len]) {
+                                                extracted_sni = Some(sni);
+                                                break;
                                             }
+                                            if initial_len >= 5 {
+                                                let record_len = ((initial_buf[3] as usize) << 8) | (initial_buf[4] as usize);
+                                                if initial_len >= 5 + record_len {
+                                                    break;
+                                                }
+                                            }
+                                        } else if crate::routing::is_http_request(&initial_buf[..initial_len]) {
+                                            if let Some(host) = crate::routing::extract_http_host(&initial_buf[..initial_len]) {
+                                                extracted_sni = Some(host);
+                                                break;
+                                            } else if initial_buf[..initial_len].windows(4).any(|w| w == b"\r\n\r\n")
+                                                || initial_buf[..initial_len].windows(2).any(|w| w == b"\n\n")
+                                            {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
                                         }
                                     }
                                 }).await;
                                 let initial_data = initial_buf[..initial_len].to_vec();
+
+                                // L4/L7 Multiplexing Logic: Check if SNI matches Web Server
+                                let mut is_web_server = false;
+                                let mut is_plaintext_http = false;
+                                if let Some(sni) = &extracted_sni {
+                                    if ws_routes_clone.iter().any(|c| *sni == c.domain || sni.ends_with(&format!(".{}", c.domain))) {
+                                        is_web_server = true;
+                                        if initial_buf[0] != 0x16 {
+                                            is_plaintext_http = true;
+                                        }
+                                    }
+                                }
+
+
+
+                                if is_web_server {
+                                    let prefixed_tcp = crate::prefixed_stream::PrefixedStream {
+                                        prefix: initial_data,
+                                        inner: local_tcp,
+                                    };
+                                    let sni = extracted_sni.clone().unwrap_or_default();
+                                    
+                                    if is_plaintext_http {
+                                        tracing::debug!("🌐 [Client Web Server] Handling direct HTTP/1.1 plaintext connection for domain: {}", sni);
+                                        let mut matched_routes: Vec<crate::config::WebServerConfig> = ws_routes_clone.iter()
+                                            .filter(|c| *sni == c.domain)
+                                            .cloned()
+                                            .collect();
+                                        if matched_routes.is_empty() {
+                                            matched_routes = ws_routes_clone.iter()
+                                                .filter(|c| sni.ends_with(&format!(".{}", c.domain)))
+                                                .cloned()
+                                                .collect();
+                                        }
+                                        if !matched_routes.is_empty() {
+                                            crate::web_server::handle_web_server_connection(prefixed_tcp, ws_routes_clone.to_vec(), Some(peer.ip())).await;
+                                        }
+                                    } else {
+                                        if let Some(acceptor) = &*acceptor_clone {
+                                            match tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(prefixed_tcp)).await {
+                                                Ok(Ok(tls_stream)) => {
+                                                    let tls_sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string()).unwrap_or(sni.clone());
+                                                    let mut matched_routes: Vec<crate::config::WebServerConfig> = ws_routes_clone.iter()
+                                                        .filter(|c| tls_sni == c.domain)
+                                                        .cloned()
+                                                        .collect();
+                                                    if matched_routes.is_empty() {
+                                                        matched_routes = ws_routes_clone.iter()
+                                                            .filter(|c| tls_sni.ends_with(&format!(".{}", c.domain)))
+                                                            .cloned()
+                                                            .collect();
+                                                    }
+                                                    if !matched_routes.is_empty() {
+                                                        crate::web_server::handle_web_server_connection(tls_stream, ws_routes_clone.to_vec(), Some(peer.ip())).await;
+                                                    }
+                                                },
+                                                Ok(Err(e)) => tracing::error!("❌ [Web Server] TLS Handshake failed for {}: {}", sni, e),
+                                                Err(_) => tracing::error!("❌ [Web Server] TLS Handshake timed out for {}", sni),
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
 
                                 let target_up = if let Some(sni) = &extracted_sni {
                                     trace!("[Conn #{}] Detected SNI: {}", c_id, sni);
@@ -341,7 +617,17 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                 };
 
                                 let target_up = match target_up {
-                                    Some(t) => t,
+                                    Some(t) => {
+                                        if !t.contains(':') && t.parse::<u16>().is_ok() {
+                                            if let Some(sni) = &extracted_sni {
+                                                format!("{}:{}", sni, t)
+                                            } else {
+                                                t
+                                            }
+                                        } else {
+                                            t
+                                        }
+                                    },
                                     None => {
                                         warn!("[Conn #{}] Connection from {} dropped: No matching SNI or default route.", c_id, peer);
                                         return;
@@ -356,7 +642,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                 let mut final_response = None;
                                 let mut global_retries = 0;
                                 let mut failed_snis = std::collections::HashSet::new();
-                                
+
                                 while global_retries < 5 {
                                     let mut ready_client = None;
                                     let mut retries = 0;
@@ -366,16 +652,16 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         let mut best_remote = None;
                                         let mut lowest_latency = f64::MAX;
                                         let total_pool_size = pool_clone.len();
-                                        
+
                                         for i in 0..total_pool_size {
                                             let (pool_slot, target_remote) = &pool_clone[i];
-                                            
+
                                             if failed_snis.contains(&target_remote.sni) {
                                                 continue;
                                             }
-                                            
+
                                             let mut slot_guard = pool_slot.lock().await;
-                                            
+
                                             if let Some(c) = &slot_guard.client {
                                                 let mut c_clone = c.clone();
                                                 if let Ok(_) = std::future::poll_fn(|cx| c_clone.poll_ready(cx)).await {
@@ -409,12 +695,12 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                         }
                                     }
-                                    
+
                                     if ready_client.is_none() {
                                         tracing::warn!("[Conn #{}] All pool slots are disconnected! Connection dropped.", c_id);
                                         return;
                                     }
-                                    
+
                                     let (mut c, pool_slot, target_remote) = ready_client.unwrap();
 
                                     let final_target_up = target_up.clone();
@@ -438,7 +724,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         .header("Host", target_remote.sni.clone())
                                         .header("x-tunnel-target", final_target_up.clone())
                                         .header("x-tunnel-secret", cfg_inner.secret.clone().unwrap_or_default());
-                                        
+
                                     if try_local {
                                         req_builder = req_builder.header("x-tunnel-try-local", "true");
                                     }
@@ -454,11 +740,11 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     let mut slot = pool_slot.lock().await;
                                                     slot.ewma_latency = (0.2 * latency) + (0.8 * slot.ewma_latency);
                                                     slot.consecutive_errors = 0;
-                                                    
+
                                                     if !failed_snis.is_empty() {
                                                         tracing::debug!("[Conn #{}] TCP Tunnel successfully fell back to alternate SNI: {}", c_id, target_remote.sni);
                                                     }
-                                                    
+
                                                     final_send_stream = Some(send_stream);
                                                     final_response = Some(res);
                                                     break;
@@ -486,12 +772,12 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
 
                                     global_retries += 1;
                                 }
-                                
+
                                 if final_send_stream.is_none() {
                                     tracing::warn!("[Conn #{}] All tunnel attempts failed.", c_id);
                                     return;
                                 }
-                                
+
                                 let mut send_stream = final_send_stream.unwrap();
                                 let response = final_response.unwrap();
 
@@ -503,7 +789,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                 init_buf[1..5].copy_from_slice(&(initial_data.len() as u32).to_be_bytes());
                                                 init_buf.extend_from_slice(&initial_data);
                                                 let framed = init_buf.freeze();
-                                                
+
                                                 if crate::net_utils::send_h2_data(&mut send_stream, framed, false).await.is_err() { return; }
                                             }
 
@@ -522,7 +808,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                             };
                                                             read_buf[1..5].copy_from_slice(&(n as u32).to_be_bytes());
                                                             let framed = read_buf.split().freeze();
-                                                            
+
                                                             if crate::net_utils::send_h2_data(&mut send_stream, framed, false).await.is_err() { break; }
                                                         }
                                                     }
@@ -534,7 +820,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         let mut body = response.into_body();
                                         while let Some(Ok(mut data)) = body.data().await {
                                             let _ = body.flow_control().release_capacity(data.len());
-                                            
+
                                             if grpc_buf.is_empty() {
                                                 while data.len() >= 5 {
                                                     let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
@@ -564,95 +850,185 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
             }
         });
     }
-    // Standalone Local L7 Web Server Routing (Independent of GhostRPC Tunnels)
-    if let Some(ws_configs) = &cfg.web_server {
-        if !ws_configs.is_empty() {
-            let mut bind_map: std::collections::HashMap<String, Vec<crate::config::WebServerConfig>> = std::collections::HashMap::new();
-            for ws in ws_configs {
-                let parts: Vec<&str> = ws.domain.split(':').collect();
-                let port = if parts.len() > 1 { parts[1] } else { "443" };
-                let bind_addr = format!("0.0.0.0:{}", port);
-                bind_map.entry(bind_addr).or_default().push(ws.clone());
+
+    if let Some(sni_configs) = &cfg.sni_proxy {
+        let mut client_sni_routes = std::collections::HashMap::new();
+        crate::routing::parse_server_sni_proxy(
+            sni_configs,
+            "0.0.0.0:443", // fallback bind if port not specified
+            &mut client_sni_routes,
+        );
+
+        let mut unique_targets = std::collections::HashSet::new();
+        for (_, rt) in &client_sni_routes {
+            for target in rt.sni_rules.values() {
+                for t in target.split(',') {
+                    unique_targets.insert(t.trim().to_string());
+                }
             }
-            
-            let mut resolver = rustls::server::ResolvesServerCertUsingSni::new();
-            let mut loaded_certs = 0;
-            let exe_dir = std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).parent().unwrap_or(std::path::Path::new("")).to_path_buf();
-            let certs_dir = exe_dir.join("certs");
-            
-            if certs_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(certs_dir) {
-                    for entry in entries.flatten() {
-                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                            let domain = entry.file_name().to_string_lossy().to_string();
-                            let cert_path = entry.path().join("fullchain.pem");
-                            let key_path = entry.path().join("privkey.pem");
-                            if cert_path.exists() && key_path.exists() {
-                                if let Ok(cert_file) = std::fs::File::open(&cert_path) {
-                                    if let Ok(key_file) = std::fs::File::open(&key_path) {
-                                        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file)).map(|r| r.unwrap()).collect();
-                                        if let Ok(Some(key)) = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file)) {
-                                            if let Ok(sign_key) = rustls::crypto::ring::sign::any_supported_type(&key) {
-                                                let certified_key = rustls::sign::CertifiedKey::new(certs, sign_key);
-                                                let _ = resolver.add(&domain, certified_key.clone());
-                                                let _ = resolver.add(&format!("*.{}", domain), certified_key);
-                                                loaded_certs += 1;
-                                            }
-                                        }
-                                    }
+            if let Some(target) = &rt.default_upstream {
+                for t in target.split(',') {
+                    unique_targets.insert(t.trim().to_string());
+                }
+            }
+        }
+
+        let hc_cancel = cancel_token.clone();
+        if !unique_targets.is_empty() {
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = hc_cancel.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
+                    let mut targets_to_check = unique_targets.clone();
+                    {
+                        let dead = get_client_dead_targets().read().unwrap();
+                        for t in dead.iter() {
+                            targets_to_check.insert(t.clone());
+                        }
+                    }
+                    let mut recovered = Vec::new();
+                    let mut newly_dead = Vec::new();
+                    for target in &targets_to_check {
+                        match crate::anti_loop::safe_connect(target, std::time::Duration::from_secs(2)).await {
+                            Ok(_) => recovered.push(target.clone()),
+                            Err(_) => {
+                                if unique_targets.contains(target) {
+                                    newly_dead.push(target.clone());
                                 }
                             }
                         }
                     }
+                    let mut dead_guard = get_client_dead_targets().write().unwrap();
+                    for t in recovered {
+                        dead_guard.remove(&t);
+                    }
+                    for t in newly_dead {
+                        dead_guard.insert(t);
+                    }
+                }
+            });
+        }
+
+        for (bind_addr, route_table) in client_sni_routes {
+            let mut listener_opt = None;
+            for i in 0..10 {
+                match crate::net_utils::create_reuseport_listener(&bind_addr) {
+                    Ok(l) => {
+                        listener_opt = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ Failed to bind SNI proxy {} (attempt {}/10): {}. Retrying in 200ms...", bind_addr, i + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
                 }
             }
-            
-            if loaded_certs == 0 {
-                tracing::warn!("⚠️ هیچ گواهینامه‌ای در مسیر certs پیدا نشد! ارتباطات TLS کلاینت ممکن است با خطا مواجه شوند.");
-            }
-
-            let mut tls_config = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
-            
-            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-
-            for (local_bind, ws_list) in bind_map {
-                let acceptor = acceptor.clone();
-                let ws_list_clone = Arc::new(ws_list);
-                let token_clone = cancel_token.clone();
+            if let Some(listener) = listener_opt {
+                tracing::info!("🛡️ Client SNI Proxy listening on {}", bind_addr);
+                let rt = std::sync::Arc::new(route_table);
+                let l_cancel = cancel_token.clone();
                 tokio::spawn(async move {
-                    if let Ok(listener) = tokio::net::TcpListener::bind(&local_bind).await {
-                        tracing::info!("🔒 Client Standalone L7 Web Server active on {}", local_bind);
-                        loop {
-                            tokio::select! {
-                                _ = token_clone.cancelled() => break,
-                                Ok((tcp, _)) = listener.accept() => {
-                                    let _ = tcp.set_nodelay(true);
-                                    crate::net_utils::tune_socket_buffers(&tcp);
-                                    let acceptor = acceptor.clone();
-                                    let ws_list = ws_list_clone.clone();
-                                    let peer_addr = tcp.peer_addr().ok().map(|a| a.ip());
+                    loop {
+                        tokio::select! {
+                            _ = l_cancel.cancelled() => break,
+                            accept_res = listener.accept() => {
+                                if let Ok((mut local_tcp, peer)) = accept_res {
+                                    if crate::anti_loop::is_loop(&peer) {
+                                        crate::net_utils::log_rate_limited(&format!("anti_loop_{}", peer), "🛑 Anti-Loop Firewall: Dropped self-loop connection in client SNI proxy.");
+                                        continue;
+                                    }
+                                    let _ = local_tcp.set_nodelay(true);
+                                    crate::net_utils::tune_socket_buffers(&local_tcp);
+                                    crate::net_utils::enable_tcp_keepalive(&local_tcp);
+                                    
+                                    let rt_clone = rt.clone();
                                     tokio::spawn(async move {
-                                        if let Ok(tls_stream) = acceptor.accept(tcp).await {
-                                            let sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string());
-                                            if let Some(s) = &sni {
-                                                let matched_routes: Vec<crate::config::WebServerConfig> = ws_list.iter()
-                                                    .filter(|c| c.domain.starts_with(s))
-                                                    .cloned()
-                                                    .collect();
-                                                if !matched_routes.is_empty() {
-                                                    crate::web_server::handle_web_server_connection(tls_stream, matched_routes, peer_addr).await;
+                                        let mut extracted_sni = None;
+                                        let mut initial_buf = [0u8; 8192];
+                                        let mut initial_len = 0;
+                                        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                                            loop {
+                                                if initial_len >= 8192 { break; }
+                                                let n = match tokio::io::AsyncReadExt::read(&mut local_tcp, &mut initial_buf[initial_len..]).await {
+                                                    Ok(n) if n > 0 => n,
+                                                    _ => break,
+                                                };
+                                                initial_len += n;
+                                                if initial_buf[0] == 0x16 {
+                                                    if let Some(sni) = crate::routing::extract_sni(&initial_buf[..initial_len]) {
+                                                        extracted_sni = Some(sni);
+                                                        break;
+                                                    }
+                                                    if initial_len >= 5 {
+                                                        let record_len = ((initial_buf[3] as usize) << 8) | (initial_buf[4] as usize);
+                                                        if initial_len >= 5 + record_len { break; }
+                                                    }
+                                                } else if crate::routing::is_http_request(&initial_buf[..initial_len]) {
+                                                    if let Some(host) = crate::routing::extract_http_host(&initial_buf[..initial_len]) {
+                                                        extracted_sni = Some(host);
+                                                        break;
+                                                    } else if initial_buf[..initial_len].windows(4).any(|w| w == b"\r\n\r\n") || initial_buf[..initial_len].windows(2).any(|w| w == b"\n\n") {
+                                                        break;
+                                                    }
+                                                } else {
+                                                    break;
                                                 }
+                                            }
+                                        }).await;
+
+                                        let target_up = if let Some(sni) = &extracted_sni {
+                                            rt_clone.sni_rules.get(sni).or_else(|| rt_clone.sni_rules.get("*")).cloned().or_else(|| rt_clone.default_upstream.clone())
+                                        } else {
+                                            rt_clone.sni_rules.get("*").cloned().or_else(|| rt_clone.default_upstream.clone())
+                                        };
+
+                                        if let Some(target_list) = target_up {
+                                            let mut healthy_targets = Vec::new();
+                                            {
+                                                let dead = get_client_dead_targets().read().unwrap();
+                                                for t in target_list.split(',') {
+                                                    let t = t.trim();
+                                                    if !dead.contains(t) && !t.is_empty() {
+                                                        healthy_targets.push(t.to_string());
+                                                    }
+                                                }
+                                            }
+
+                                            if healthy_targets.is_empty() {
+                                                crate::net_utils::log_rate_limited(
+                                                    &format!("client_circuit_breaker_{:?}", extracted_sni),
+                                                    &format!("Circuit Breaker: All targets for Client SNI {:?} are dead (pool: {}). Dropping.", extracted_sni, target_list)
+                                                );
+                                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                                return;
+                                            }
+
+                                            // Active-Passive priority based routing
+                                            let target = healthy_targets[0].clone();
+                                            tracing::debug!("🔄 Client SNI Routing triggered for {:?} -> {} (from pool: {})", extracted_sni, target, target_list);
+
+                                            match crate::anti_loop::safe_connect(&target, std::time::Duration::from_secs(10)).await {
+                                                Ok(mut upstream_tcp) => {
+                                                    let _ = upstream_tcp.set_nodelay(true);
+                                                    crate::net_utils::tune_socket_buffers(&upstream_tcp);
+                                                    crate::net_utils::enable_tcp_keepalive(&upstream_tcp);
+                                                    
+                                                    if initial_len > 0 {
+                                                        if tokio::io::AsyncWriteExt::write_all(&mut upstream_tcp, &initial_buf[..initial_len]).await.is_err() {
+                                                            return;
+                                                        }
+                                                    }
+                                                    let _ = tokio::io::copy_bidirectional(&mut local_tcp, &mut upstream_tcp).await;
+                                                }
+                                                Err(e) => crate::net_utils::log_rate_limited(&format!("client_fail_{}", target), &format!("❌ Failed to connect to Client SNI proxy target {}: {}", target, e)),
                                             }
                                         }
                                     });
                                 }
                             }
                         }
-                    } else {
-                        tracing::error!("Failed to bind TLS listener on {}", local_bind);
                     }
                 });
             }

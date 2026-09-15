@@ -6,10 +6,10 @@ secret = "my_secret_password"
 # مسیر مخفی برای درخواست‌های تونل (باید با سرور یکی باشد)
 hidden_path = "/api/v4/telemetry"
 
-# دامنه‌ها و زیردامنه‌های مجاز برای برقراری تونل (SNI) - کلاینت از این دامنه‌ها برای وصل شدن استفاده می‌کند
-tunnel_sni = [
-    "domain.com",
-    "*.domain.com"
+# دامنه‌های مجاز برای دریافت گواهینامه ACME (اختیاری)
+acme_domains = [
+    "example.com",
+    "*.example.com"
 ]
 
 # تعداد کانکشن‌های همزمان در Pool برای هر سرور (هر نود کلاینت) - برای مدیریت بهینه ترافیک
@@ -69,38 +69,50 @@ port_mappings = [
     "8443:443",    # هدایت ترافیک پورت 8443 لوکال به پورت 443 مقصد
 ]
 
+# تنظیمات مسیریابی فوق‌سریع ترافیک بر اساس دامنه (SNI Routing) برای کلاینت (اختیاری)
+[[client.sni_proxy]]
+incoming_sni = [
+    "us.SNI.COM:443",
+    "fr.SNI.COM:443",
+    "tr.SNI.COM:443",
+]
+target = [
+    "127.0.0.1:9443",
+]
+
 
 # ====================================================================
 # مسیرهای مستقل کلاینت به عنوان وب‌سرور لایه ۷
 # ترافیک را روی پورت لوکال با گواهی سرور دریافت و پردازش می‌کند.
 # ====================================================================
 
-# 1. حالت استاتیک (نمایش فایل‌های HTML/CSS/JS)
+# 1. حالت استاتیک (نمایش فایل‌های پنل یا HTML)
+[[client.web_server]]
+domain = "panel.example.com"
+path = "/"
+type = "static"
+root = "panel_ui/dist"
+
+# 2. حالت استاتیک پیشرفته با Rewrite مسیر
 [[client.web_server]]
 domain = "static.example.com"
 path = "/"
 type = "static"
 root = "/var/www/html"
+"/" = "/index.html"
 
-# 2. حالت FastCGI (برای سایت‌های PHP مثل وردپرس)
+# 3. حالت FastCGI (برای سایت‌های PHP)
 [[client.web_server]]
-domain = "php.example.com"
+domain = "dl.example.com"
 path = "/"
 type = "fastcgi"
-root = "/var/www/wordpress"
-target = "127.0.0.1:9000"  # آدرس PHP-FPM
-SCRIPT_FILENAME = "/var/www/wordpress/index.php"
+root = "/var/www/html"
+target = "unix:///var/run/php/php8.1-fpm.sock"
+"/" = "/download.php"
 
-# 3. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سایت‌های بک‌اند با HTTP)
+# 4. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سرویس‌های دیگر)
 [[client.web_server]]
-domain = "panel.example.com"
+domain = "chat.example.com"
 path = "/"
 type = "reverse_proxy"
-target = "http://127.0.0.1:8000"
-
-# 4. حالت Reverse Proxy (برای اتصال به سوکت‌های یونیکس مثل X-UI)
-[[client.web_server]]
-domain = "xui.example.com"
-path = "/"
-type = "reverse_proxy"
-target = "unix//var/lib/xui/xui.socket"
+target = "127.0.0.1:8080"

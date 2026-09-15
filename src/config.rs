@@ -12,9 +12,10 @@ pub struct WebServerConfig {
     pub path: String,
     pub r#type: String, // "static", "fastcgi", "reverse_proxy"
     pub root: Option<String>,
-    #[allow(dead_code)]
-    pub precompress: Option<bool>,
     pub target: Option<String>,
+    pub block_hidden_files: Option<bool>,
+    #[serde(default)]
+    pub rewrites: Option<HashMap<String, String>>,
     #[serde(flatten)]
     pub extra: HashMap<String, String>,
 }
@@ -31,11 +32,21 @@ pub struct AppConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct SniProxyConfig {
+    #[serde(default)]
+    pub incoming_sni: Vec<String>,
+    #[serde(default)]
+    pub target: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct ServerConfig {
     pub log_level: Option<String>,
+    #[serde(default)]
     pub bind_addr: String,
+    #[serde(default)]
     pub hidden_path: String,
-    pub sni_proxy: Option<Vec<String>>,
+    pub sni_proxy: Option<Vec<SniProxyConfig>>,
     pub web_server: Option<Vec<WebServerConfig>>,
     pub camouflage_target: Option<String>,
     pub cloudflare_api_token: Option<String>,
@@ -43,6 +54,7 @@ pub struct ServerConfig {
     pub tunnel_sni: Option<Vec<String>>,
     pub secret: Option<String>,
     pub copy_certs_to: Option<Vec<String>>,
+
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -63,12 +75,15 @@ pub struct ClientConfig {
     pub web_server: Option<Vec<WebServerConfig>>,
     pub cloudflare_api_token: Option<String>,
     pub arvancloud_api_token: Option<String>,
-    pub tunnel_sni: Option<Vec<String>>,
+    pub acme_domains: Option<Vec<String>>,
+    #[serde(default)]
     pub remotes: Vec<RemoteLocation>,
+    #[serde(default)]
     pub hidden_path: String,
     pub pool_size_per_node: Option<usize>,
     pub secret: Option<String>,
     pub copy_certs_to: Option<Vec<String>>,
+    pub sni_proxy: Option<Vec<SniProxyConfig>>,
 }
 
 #[derive(Debug, Clone, Default)]

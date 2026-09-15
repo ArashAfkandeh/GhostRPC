@@ -34,10 +34,14 @@ log_level = "info"
 # تنظیمات مسیریابی فوق‌سریع ترافیک بر اساس دامنه (SNI Routing)
 # در این بخش می‌توانید تعیین کنید که اگر کلاینت با یکی از دامنه‌های زیر به سرور متصل شد،
 # ترافیک آن بدون بازگشایی رمزنگاری (Zero-Copy) مستقیماً به آی‌پی و پورت مشخص شده هدایت شود.
-# فرمت: "دامنه:پورت_ورودی=آی‌پی_مقصد:پورت_مقصد"
-sni_proxy = [
-    "tr.SNI.COM:443=127.0.0.2:443",
-    "de.SNI.COM:443=127.0.0.2:443",
+[[server.sni_proxy]]
+incoming_sni = [
+    "us.SNI.COM:443",
+    "fr.SNI.COM:443",
+    "tr.SNI.COM:443",
+]
+target = [
+    "127.0.0.1:9443",
 ]
 
 
@@ -46,32 +50,33 @@ sni_proxy = [
 # ترافیک را روی پورت لوکال با گواهی سرور دریافت و پردازش می‌کند.
 # ====================================================================
 
-# 1. حالت استاتیک (نمایش فایل‌های HTML/CSS/JS)
+# 1. حالت استاتیک (نمایش فایل‌های پنل یا HTML)
+[[server.web_server]]
+domain = "panel.example.com"
+path = "/"
+type = "static"
+root = "panel_ui/dist"
+
+# 2. حالت استاتیک پیشرفته با Rewrite مسیر
 [[server.web_server]]
 domain = "static.example.com"
 path = "/"
 type = "static"
 root = "/var/www/html"
+"/" = "/index.html"
 
-# 2. حالت FastCGI (برای سایت‌های PHP مثل وردپرس)
+# 3. حالت FastCGI (برای سایت‌های PHP)
 [[server.web_server]]
-domain = "php.example.com"
+domain = "dl.example.com"
 path = "/"
 type = "fastcgi"
-root = "/var/www/wordpress"
-target = "127.0.0.1:9000"  # آدرس PHP-FPM
-SCRIPT_FILENAME = "/var/www/wordpress/index.php"
+root = "/var/www/html"
+target = "unix:///var/run/php/php8.1-fpm.sock"
+"/" = "/download.php"
 
-# 3. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سایت‌های بک‌اند با HTTP)
+# 4. حالت Reverse Proxy (برای اتصال به وب‌پنل یا سرویس‌های دیگر)
 [[server.web_server]]
-domain = "panel.example.com"
+domain = "chat.example.com"
 path = "/"
 type = "reverse_proxy"
-target = "http://127.0.0.1:8000"
-
-# 4. حالت Reverse Proxy (برای اتصال به سوکت‌های یونیکس مثل پاسارگارد)
-[[server.web_server]]
-domain = "socket.example.com"
-path = "/"
-type = "reverse_proxy"
-target = "unix//var/lib/pasarguard/pasarguard.socket"
+target = "127.0.0.1:8080"

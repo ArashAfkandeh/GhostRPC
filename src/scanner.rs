@@ -39,9 +39,14 @@ impl Scanner {
         }
     }
 
-    pub fn start(self) {
+    pub fn start(self, cancel_token: tokio_util::sync::CancellationToken) {
         tokio::spawn(async move {
-            self.run_loop().await;
+            tokio::select! {
+                _ = self.run_loop() => {}
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("🛑 Stopping IP Scanner due to Hot-Reload...");
+                }
+            }
         });
     }
 

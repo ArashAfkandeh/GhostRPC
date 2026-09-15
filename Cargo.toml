@@ -1,6 +1,6 @@
 [package]
 name = "GhostRPC"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 
 [dependencies]
@@ -21,7 +21,7 @@ webpki-roots = "1.0.1"
 socket2 = "0.6.1"
 mimalloc = "0.1.44"
 libc = "0.2.172"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json", "http2"] }
 instant-acme = "0.8.5"
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 serde_json = "1.0"
@@ -39,6 +39,8 @@ fastcgi-client = { version = "0.11.1", features = ["runtime-tokio", "http"] }
 http-body-util = "0.1.4"
 futures-util = "0.3.33"
 tungstenite = "0.21.0"
+dashmap = "6"
+mime_guess = "2"
 ws_stream_tungstenite = { version = "0.13.0", features = ["tokio"] }
 yamux = "0.10.1"
 tokio-tungstenite = { version = "0.21.0", features = ["stream"] }

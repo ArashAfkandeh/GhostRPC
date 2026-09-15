@@ -53,34 +53,142 @@ where
     let hyper_service = hyper_util::service::TowerToHyperService::new(app);
     let io = TokioIo::new(tls_stream);
 
-    let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+    let res = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
         .serve_connection(io, hyper_service)
         .await;
+    
+    if let Err(e) = res {
+        tracing::error!("❌ [Web Server] Connection error while serving client: {}", e);
+    }
 }
 
 async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Response {
-    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let mut path = req.uri().path().to_string();
+    tracing::info!("📥 [Web Server] Received {} request for path: {}", method, path);
     
+    let host = req.headers().get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().host())
+        .unwrap_or("");
+    let host_domain = host.split(':').next().unwrap_or(host);
+    tracing::debug!("🌐 [Web Server] Extracted Host: {}", host_domain);
+
+    let mut matched_routes: Vec<&crate::config::WebServerConfig> = state.routes.iter()
+        .filter(|r| r.domain == host_domain)
+        .collect();
+    
+    if matched_routes.is_empty() {
+        matched_routes = state.routes.iter()
+            .filter(|r| host_domain.ends_with(&format!(".{}", r.domain)))
+            .collect();
+            
+    }
+
     let mut matched_route = None;
-    for route in &state.routes {
+    for route in &matched_routes {
         if route.path == "/" || route.path == "*" || route.path == "/*" {
-            matched_route = Some(route);
+            matched_route = Some(*route);
             break;
         } else if path == route.path || path.starts_with(&format!("{}/", route.path.trim_end_matches('/'))) {
-            matched_route = Some(route);
+            matched_route = Some(*route);
             break;
         }
     }
 
+    let mut req = req;
+
     let route = match matched_route {
-        Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, "Not Found").into_response(),
+        Some(r) => {
+            tracing::info!("✅ [Web Server] Path {} matched route configuration of type '{}'", path, r.r#type);
+            r
+        },
+        None => {
+            tracing::info!("🔄 [Web Server] Path {} did not match any route. Falling back to panel_ui.", path);
+            let exe_dir = std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).parent().unwrap_or(std::path::Path::new("")).to_path_buf();
+            let ui_dir = exe_dir.join("panel_ui/dist");
+            let req_path = path.trim_start_matches('/');
+            let file_path = ui_dir.join(req_path);
+            
+            if file_path.exists() && file_path.is_file() {
+                let content_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+                if let Ok(content) = tokio::fs::read(&file_path).await {
+                    return axum::response::Response::builder()
+                        .header("Content-Type", content_type.as_ref())
+                        .body(axum::body::Body::from(content))
+                        .unwrap();
+                }
+            }
+            
+            let index_file = ui_dir.join("index.html");
+            if let Ok(content) = tokio::fs::read(&index_file).await {
+                return axum::response::Response::builder()
+                    .header("Content-Type", "text/html")
+                    .body(axum::body::Body::from(content))
+                    .unwrap();
+            }
+            
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
     };
+
+    if route.block_hidden_files.unwrap_or(true) {
+        let file_name = path.split('/').last().unwrap_or("");
+        if file_name.starts_with('.') {
+            tracing::warn!("❌ [Web Server] Blocked access to hidden file: {}", path);
+            return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+        }
+    }
+
+    let new_path_opt = if let Some(rewrites) = &route.rewrites {
+        rewrites.get(&path).cloned()
+    } else {
+        None
+    }.or_else(|| route.extra.get(&path).cloned());
+
+    if let Some(new_path) = new_path_opt {
+        tracing::info!("🔄 [Web Server] Rewriting path from {} to {}", path, new_path);
+        let mut parts = req.uri().clone().into_parts();
+        let pq = match parts.path_and_query {
+            Some(ref old_pq) => {
+                let mut pq_str = new_path.clone();
+                if let Some(q) = old_pq.query() {
+                    pq_str.push('?');
+                    pq_str.push_str(q);
+                }
+                axum::http::uri::PathAndQuery::try_from(pq_str.as_str()).unwrap_or_else(|_| axum::http::uri::PathAndQuery::from_static("/"))
+            }
+            None => axum::http::uri::PathAndQuery::try_from(new_path.as_str()).unwrap_or_else(|_| axum::http::uri::PathAndQuery::from_static("/")),
+        };
+        parts.path_and_query = Some(pq);
+        if let Ok(new_uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = new_uri;
+        }
+        path = new_path;
+    }
 
     match route.r#type.as_str() {
         "static" => {
-            let root = route.root.clone().unwrap_or_else(|| "./".to_string());
-            let serve_dir = ServeDir::new(root).precompressed_gzip().precompressed_br();
+            let root_str = route.root.clone().unwrap_or_else(|| "./".to_string());
+            let root_path = std::path::Path::new(&root_str);
+            let absolute_root = if root_path.is_absolute() {
+                root_path.to_path_buf()
+            } else {
+                let exe_dir = std::env::current_exe()
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .to_path_buf();
+                exe_dir.join(root_path)
+            };
+            
+            let index_file = absolute_root.join("index.html");
+            
+            let serve_dir = ServeDir::new(&absolute_root)
+                .fallback(tower_http::services::ServeFile::new(index_file))
+                .precompressed_gzip()
+                .precompressed_br();
+                
             match serve_dir.oneshot(req).await {
                 Ok(res) => res.into_response(),
                 Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Static file error").into_response(),
@@ -88,6 +196,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
         }
         "reverse_proxy" => {
             let target = route.target.clone().unwrap_or_default();
+            tracing::info!("🔄 [Reverse Proxy] Forwarding request {} to target: {}", path, target);
             let target_trim = target.trim_end_matches('/');
             
             let host_header = req.headers().get(axum::http::header::HOST)
@@ -172,6 +281,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
 
             match builder.send().await {
                 Ok(resp) => {
+                    tracing::info!("✅ [Reverse Proxy] Successfully received response from target (Status: {})", resp.status());
                     let mut res_builder = axum::response::Response::builder().status(resp.status());
                     for (k, v) in resp.headers() {
                         res_builder = res_builder.header(k.clone(), v.clone());
@@ -180,14 +290,28 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                     let body = axum::body::Body::from_stream(stream);
                     res_builder.body(body).unwrap()
                 }
-                Err(_) => (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response(),
+                Err(e) => {
+                    tracing::error!("❌ [Reverse Proxy] Gateway Error! Failed to forward request to {}: {}", url, e);
+                    (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response()
+                }
             }
         }
         "fastcgi" => {
             let target = route.target.clone().unwrap_or_else(|| "127.0.0.1:9000".to_string());
-            match handle_fastcgi(&target, &route, req).await {
-                Ok(res) => res,
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("FastCGI Error: {}", e)).into_response(),
+            let current_path = req.uri().path();
+            if !current_path.ends_with(".php") && !current_path.ends_with('/') {
+                let root = route.root.clone().unwrap_or_else(|| "./".to_string());
+                let serve_dir = tower_http::services::ServeDir::new(root).precompressed_gzip().precompressed_br();
+                use tower::ServiceExt;
+                match serve_dir.oneshot(req).await {
+                    Ok(res) => res.into_response(),
+                    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Static file error").into_response(),
+                }
+            } else {
+                match handle_fastcgi(&target, &route, req).await {
+                    Ok(res) => res,
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("FastCGI Error: {}", e)).into_response(),
+                }
             }
         }
         _ => (StatusCode::BAD_REQUEST, "Unknown route type").into_response(),
@@ -268,14 +392,25 @@ async fn handle_unix_reverse_proxy(socket_path: &str, req: Request, client_ip_st
     use hyper_util::rt::TokioIo;
     use axum::body::Body;
 
-    let stream = UnixStream::connect(socket_path).await.map_err(|e| format!("Failed to connect to unix socket: {}", e))?;
+    tracing::debug!("🔌 [Unix Proxy] Attempting to connect to unix socket: {}", socket_path);
+    let stream = match tokio::time::timeout(std::time::Duration::from_secs(5), UnixStream::connect(socket_path)).await {
+        Ok(Ok(s)) => {
+            tracing::debug!("🔌 [Unix Proxy] Successfully connected to unix socket: {}", socket_path);
+            s
+        },
+        Ok(Err(e)) => return Err(format!("Failed to connect to unix socket: {}", e)),
+        Err(_) => return Err("Timeout connecting to unix socket".to_string()),
+    };
+    
     let io = TokioIo::new(stream);
     
+    tracing::debug!("🔌 [Unix Proxy] Performing HTTP/1.1 handshake on unix socket...");
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.map_err(|e| format!("Unix handshake error: {}", e))?;
+    tracing::debug!("🔌 [Unix Proxy] HTTP/1.1 handshake successful.");
     
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
-            let _ = err;
+            tracing::error!("❌ [Unix Proxy] Connection error: {}", err);
         }
     });
 
@@ -311,10 +446,19 @@ async fn handle_unix_reverse_proxy(socket_path: &str, req: Request, client_ip_st
 
     let req = axum::http::Request::from_parts(parts, body);
 
-    let res = sender.send_request(req).await.map_err(|e| format!("Unix request error: {}", e))?;
+    tracing::debug!("📨 [Unix Proxy] Sending request to unix socket backend...");
+    let res = match tokio::time::timeout(std::time::Duration::from_secs(30), sender.send_request(req)).await {
+        Ok(Ok(r)) => {
+            tracing::info!("✅ [Unix Proxy] Received response from backend (Status: {})", r.status());
+            r
+        },
+        Ok(Err(e)) => return Err(format!("Unix request error: {}", e)),
+        Err(_) => return Err("Timeout waiting for response from unix socket backend".to_string()),
+    };
     
     let (res_parts, res_body) = res.into_parts();
     let body = Body::new(res_body);
     
     Ok(axum::http::Response::from_parts(res_parts, body))
 }
+
