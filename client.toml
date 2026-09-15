@@ -27,7 +27,7 @@ max_ping_ms = 150
 
 # تنظیمات دریافت خودکار گواهینامه Let's Encrypt (DNS-01 Challenge) برای دامنه‌های لوکال
 cloudflare_api_token = "YOUR_CLOUDFLARE_API_TOKEN"
-# arvancloud_api_token = "YOUR_ARVANCLOUD_API_TOKEN"
+arvancloud_api_token = "YOUR_ARVANCLOUD_API_TOKEN"
 
 # (اختیاری) کپی خودکار گواهینامه‌های تولید شده/تمدید شده به مسیرهای مشخص (پوشه certs ایجاد می‌شود)
 copy_certs_to = [
