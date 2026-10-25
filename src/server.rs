@@ -61,7 +61,7 @@ impl rustls::server::ResolvesServerCert for WildcardResolver {
 
 static DEAD_TARGETS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 
-fn get_dead_targets() -> &'static RwLock<HashSet<String>> {
+pub(crate) fn get_dead_targets() -> &'static RwLock<HashSet<String>> {
     DEAD_TARGETS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
@@ -69,7 +69,9 @@ pub async fn run_server(
     cfg: ServerConfig,
     cancel_token: CancellationToken,
 ) {
-
+    // Which tunnel protocols this server accepts (h2 and/or wssmux); also used by reverse dialers.
+    let server_protos = crate::transport::parse_list(cfg.protocols.as_ref(), "server");
+    crate::transport::set_server_protocols(&server_protos);
 
     let mut resolver = WildcardResolver::new();
     let mut loaded_certs = 0;
@@ -306,6 +308,9 @@ pub async fn run_server(
             tracing::error!("❌ Failed to bind SNI Proxy listener on {}", bind_addr);
         }
     }
+    // Reverse mode: dial OUT (as an HTTP/2 client, CDN-compatible) in addition to the direct listeners.
+    crate::reverse::spawn_dialers(&cfg, cancel_token.clone());
+
     let mut bind_addrs = Vec::new();
     if !cfg.bind_addr.is_empty() {
         bind_addrs.push(cfg.bind_addr.clone());
@@ -614,6 +619,32 @@ pub async fn handle_server_connection(
         }
     } else {
         tracing::debug!("⚠️ [Routing] No SNI provided by client {}. Falling back to GhostRPC Tunnel (HTTP/2).", peer);
+    }
+    // WssMux (WebSocket + yamux) shares this port with the HTTP/2 tunnel. Direct clients pick the
+    // protocol through ALPN; CDNs (ArvanCloud...) negotiate NO ALPN toward the origin and speak
+    // HTTP/1.1, so `detect_wire` falls back to sniffing the first decrypted bytes.
+    let Some((wire, tls_stream)) = crate::transport::detect_wire(tls_stream).await else {
+        tracing::debug!("TLS connection from {} closed before sending any data", peer);
+        return;
+    };
+    if wire == crate::transport::Wire::WsMux {
+        if crate::transport::server_accepts_wssmux() {
+            crate::wssmux::serve_direct(
+                tls_stream,
+                peer,
+                &cfg_path,
+                cfg_secret.as_deref().unwrap_or(""),
+                &bind_port,
+            )
+            .await;
+        } else {
+            tracing::debug!("WebSocket tunnel request from {} ignored: \"wssmux\" is not in server protocols", peer);
+        }
+        return;
+    }
+    // `protocols` without "h2": this listener serves WssMux only (same rule as the Reverse acceptor).
+    if !crate::transport::server_accepts_h2() {
+        return;
     }
     let mut h2 = match h2::server::Builder::new()
         .initial_window_size(8_388_608) // 8 MB Stream Window (High BDP throughput)

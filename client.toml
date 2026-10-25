@@ -13,11 +13,12 @@ acme_domains = [
 ]
 
 # تعداد کانکشن‌های همزمان در Pool برای هر سرور (هر نود کلاینت) - برای مدیریت بهینه ترافیک
-pool_size_per_node = 16
+pool_size_per_node = 8
 
 # تنظیمات مربوط به فایل‌های آی‌پی
-clean_ip_file = "ips/clean_ips.txt"     # فایل حاوی آی‌پی‌های تمیز (برای ارتباط با سرورها)
-source_ips_file = "ips/source_ips.txt"   # فایل حاوی آی‌پی‌های مبدأ سرور ایران (برای مدیریت کانکشن‌ها)
+clean_ip_file = "ips/clean_ips.txt"     # cache آی‌پی‌های تمیز؛ نتیجهٔ خالی اسکن cache قبلی را پاک نمی‌کند
+scanner_cdn = "auto"                        # auto | arvancloud | cloudflare  (رنج آی‌پی اسکنر؛ auto = تشخیص خودکار از DNS دامنه)
+source_ips_file = "ips/cloudflare_ip_ranges.txt"   # فایل رنج‌های Cloudflare؛ فایل ArvanCloud: ips/arvancloud_ip_ranges.txt
 
 # فاصله زمانی بررسی سلامت آی‌پی‌ها (دقیقه)
 check_interval_minutes = 360
@@ -38,12 +39,35 @@ copy_certs_to = [
 # (اختیاری) سطح لاگ‌گیری سیستم: "trace", "debug", "info", "warn", "error"
 log_level = "info"
 
+# 🔀 (اختیاری) پروتکل‌های تانل، به ترتیب اولویت — برای Direct و Reverse هر دو
+#  "h2"     = HTTP/2 (gRPC)
+#  "wssmux" = WebSocket روی TLS + multiplexer (yamux)
+# اولین پروتکل ترجیح داده می‌شود؛ اگر وصل نشد (یا وصل شد ولی تونل را عبور نداد، مثلاً CDN بدون gRPC)
+# برنامه خودکار به پروتکل بعدی سوئیچ می‌کند. اگر ننویسید: ["h2", "wssmux"]. برای رفتار قبلی: ["h2"]
+# protocols = ["h2", "wssmux"]
+
+# فاصلهٔ پایش مستقل سلامت مسیرهای تونل (دقیقه؛ پیش‌فرض ۱، حداقل ۱)
+tunnel_health_check_interval_minutes = 1
+
+# 🔁 (اختیاری) حالت Reverse — همزمان با تانل Direct کار می‌کند
+# پورتی که سرور خارج (مستقیم یا از طریق CDN) به آن وصل می‌شود. برای Cloudflare یکی از پورت‌های
+# 443 / 2053 / 2083 / 2087 / 2096 / 8443 را بگذارید. اگر تنظیم نشود، Reverse غیرفعال است.
+# reverse_bind_addr = "0.0.0.0:2083"
+# دامنه‌های تانل Reverse (مثل tunnel_sni در سرور). دو کار می‌کند:
+#  ۱) اتصال‌هایی که SNI آن‌ها با این دامنه‌ها بخورد روی «هر» پورتِ کلاینت (مثلاً 443 مشترک با port_mappings/web_server) به Reverse می‌روند.
+#  ۲) برای زون این دامنه‌ها گواهی SSL از نوع Wildcard (zone + *.zone) خودکار با ACME گرفته و تمدید می‌شود
+#     (نیازمند cloudflare_api_token یا arvancloud_api_token در همین بخش [client]).
+# reverse_tunnel_sni = ["*.example.com"]
+
 
 # ====================================================================
 # تنظیمات مسیریابی پورت‌ها (Remote Routing)
 # ترافیک دریافتی روی پورت‌های لوکال به کدام SNI و سپس به کدام پورت در مقصد (Target) هدایت شود.
 # ====================================================================
 
+# 🔁 نکته Reverse: تانل Reverse بدون location (در server.toml) فقط فورواردر است: برای همهٔ مقصدها پس از تانل لوکیشن خودِ مقصد
+# استفاده می‌شود و سرور مستقیم به هاست مقصد وصل می‌شود (try_local = false). تانل با location برای مقصدهای همان لوکیشن
+# به localhost سرور وصل می‌شود (try_local = true) و برای لوکیشن‌های دیگر طبق share_sni به‌عنوان پشتیبان عمل می‌کند.
 [[client.remotes]]
 location = "Germany"
 # اگر ۱ باشد، یعنی درخواست‌ها می‌توانند از SNI‌های داخلی کلاینت استفاده کنند (ترافیک بازگشتی مجاز است)

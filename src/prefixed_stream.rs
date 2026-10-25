@@ -7,12 +7,15 @@ use tokio::{
     net::TcpStream,
 };
 
-pub struct PrefixedStream {
+/// Replays `prefix` (bytes that were already consumed from `inner`) before reading from `inner`.
+/// Generic so it can wrap a raw `TcpStream` (SNI sniffing) as well as a decrypted TLS stream
+/// (protocol sniffing when the peer / CDN negotiated no ALPN).
+pub struct PrefixedStream<S = TcpStream> {
     pub prefix: Vec<u8>,
-    pub inner: TcpStream,
+    pub inner: S,
 }
 
-impl AsyncRead for PrefixedStream {
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -29,7 +32,7 @@ impl AsyncRead for PrefixedStream {
     }
 }
 
-impl AsyncWrite for PrefixedStream {
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

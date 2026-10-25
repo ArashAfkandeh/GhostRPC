@@ -1,12 +1,12 @@
 [package]
 name = "GhostRPC"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 
 [dependencies]
 tokio = { version = "1.48", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 futures = "0.3"
-tokio-util = "0.7.14"
+tokio-util = { version = "0.7.14", features = ["compat"] }
 h2 = "0.4.8"
 http = "1.3.1"
 rustls = { version = "0.23.25", default-features = false, features = ["ring", "std", "tls12"] }
