@@ -71,6 +71,45 @@ if [ ! -f "Cargo.toml" ]; then
     exit 1
 fi
 
+# 3a. Web admin panel: the UI files in ./panel are embedded into the binary at compile time
+# (include_str!/include_bytes!), so no separate frontend build step or Node.js is needed.
+echo "[*] Checking web panel assets (./panel)..."
+PANEL_FILES="index.html login.html app.css i18n.js favicon.svg fonts/vazirmatn.woff2 modules/core.js modules/login.js modules/dashboard.js modules/tunnels.js modules/connections.js modules/logs.js modules/config.js modules/certs.js modules/account.js"
+PANEL_MISSING=""
+for f in $PANEL_FILES; do
+    if [ ! -s "panel/$f" ]; then
+        PANEL_MISSING="$PANEL_MISSING panel/$f"
+    fi
+done
+if [ -n "$PANEL_MISSING" ]; then
+    echo "[!] Missing or empty web panel files:$PANEL_MISSING"
+    echo "    The panel is compiled into the binary, so the build cannot continue without them."
+    exit 1
+fi
+
+# The Settings guide serves these sanitized example configurations from the binary.
+CONFIG_SAMPLES="client.toml server.toml"
+CONFIG_SAMPLES_MISSING=""
+for f in $CONFIG_SAMPLES; do
+    if [ ! -s "$f" ]; then
+        CONFIG_SAMPLES_MISSING="$CONFIG_SAMPLES_MISSING $f"
+    fi
+done
+if [ -n "$CONFIG_SAMPLES_MISSING" ]; then
+    echo "[!] Missing or empty embedded configuration samples:$CONFIG_SAMPLES_MISSING"
+    echo "    The Settings guide is compiled into the binary and requires both sample files."
+    exit 1
+fi
+
+# Optional: catch JavaScript syntax errors early when Node.js happens to be installed.
+if command -v node &> /dev/null; then
+    for js in i18n.js modules/core.js modules/login.js modules/dashboard.js modules/tunnels.js modules/connections.js modules/logs.js modules/config.js modules/certs.js modules/account.js; do
+        node --check "panel/$js" || { echo "[!] Syntax error in panel/$js"; exit 1; }
+    done
+    echo "[*] Web panel JavaScript syntax OK."
+fi
+
+# 3b. Compile (the panel is built in together with the tunnel)
 RUSTFLAGS="-C target-cpu=generic" CARGO_TARGET_DIR=/root/target cargo build --release
 rm -f ./GhostRPC
 cp /root/target/release/GhostRPC ./GhostRPC

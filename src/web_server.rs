@@ -65,7 +65,7 @@ where
 async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     let mut path = req.uri().path().to_string();
-    tracing::info!("📥 [Web Server] Received {} request for path: {}", method, path);
+    tracing::debug!("📥 [Web Server] Received {} request for path: {}", method, path);
     
     let host = req.headers().get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -79,12 +79,14 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
         .collect();
     
     if matched_routes.is_empty() {
+            
         matched_routes = state.routes.iter()
             .filter(|r| host_domain.ends_with(&format!(".{}", r.domain)))
             .collect();
             
     }
 
+            
     let mut matched_route = None;
     for route in &matched_routes {
         if route.path == "/" || route.path == "*" || route.path == "/*" {
@@ -92,6 +94,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
             break;
         } else if path == route.path || path.starts_with(&format!("{}/", route.path.trim_end_matches('/'))) {
             matched_route = Some(*route);
+            
             break;
         }
     }
@@ -100,16 +103,16 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
 
     let route = match matched_route {
         Some(r) => {
-            tracing::info!("✅ [Web Server] Path {} matched route configuration of type '{}'", path, r.r#type);
+            tracing::debug!("✅ [Web Server] Path {} matched route configuration of type '{}'", path, r.r#type);
             r
         },
         None => {
-            tracing::info!("🔄 [Web Server] Path {} did not match any route. Falling back to panel_ui.", path);
+            tracing::debug!("🔄 [Web Server] Path {} did not match any route. Falling back to panel_ui.", path);
             let exe_dir = std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).parent().unwrap_or(std::path::Path::new("")).to_path_buf();
             let ui_dir = exe_dir.join("panel_ui/dist");
             let req_path = path.trim_start_matches('/');
             let file_path = ui_dir.join(req_path);
-            
+
             if file_path.exists() && file_path.is_file() {
                 let content_type = mime_guess::from_path(&file_path).first_or_octet_stream();
                 if let Ok(content) = tokio::fs::read(&file_path).await {
@@ -119,7 +122,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                         .unwrap();
                 }
             }
-            
+
             let index_file = ui_dir.join("index.html");
             if let Ok(content) = tokio::fs::read(&index_file).await {
                 return axum::response::Response::builder()
@@ -127,7 +130,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                     .body(axum::body::Body::from(content))
                     .unwrap();
             }
-            
+
             return (StatusCode::NOT_FOUND, "Not Found").into_response();
         }
     };
@@ -147,7 +150,8 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
     }.or_else(|| route.extra.get(&path).cloned());
 
     if let Some(new_path) = new_path_opt {
-        tracing::info!("🔄 [Web Server] Rewriting path from {} to {}", path, new_path);
+                
+        tracing::debug!("🔄 [Web Server] Rewriting path from {} to {}", path, new_path);
         let mut parts = req.uri().clone().into_parts();
         let pq = match parts.path_and_query {
             Some(ref old_pq) => {
@@ -158,6 +162,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                 }
                 axum::http::uri::PathAndQuery::try_from(pq_str.as_str()).unwrap_or_else(|_| axum::http::uri::PathAndQuery::from_static("/"))
             }
+            
             None => axum::http::uri::PathAndQuery::try_from(new_path.as_str()).unwrap_or_else(|_| axum::http::uri::PathAndQuery::from_static("/")),
         };
         parts.path_and_query = Some(pq);
@@ -165,6 +170,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
             *req.uri_mut() = new_uri;
         }
         path = new_path;
+            
     }
 
     match route.r#type.as_str() {
@@ -188,7 +194,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                 .fallback(tower_http::services::ServeFile::new(index_file))
                 .precompressed_gzip()
                 .precompressed_br();
-                
+
             match serve_dir.oneshot(req).await {
                 Ok(res) => res.into_response(),
                 Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Static file error").into_response(),
@@ -196,7 +202,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
         }
         "reverse_proxy" => {
             let target = route.target.clone().unwrap_or_default();
-            tracing::info!("🔄 [Reverse Proxy] Forwarding request {} to target: {}", path, target);
+            tracing::debug!("🔄 [Reverse Proxy] Forwarding request {} to target: {}", path, target);
             let target_trim = target.trim_end_matches('/');
             
             let host_header = req.headers().get(axum::http::header::HOST)
@@ -208,7 +214,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
 
             let mut is_unix = false;
             let mut socket_path = "".to_string();
-            
+
             if let Some(stripped) = target_trim.strip_prefix("unix://") {
                 is_unix = true;
                 socket_path = stripped.to_string();
@@ -219,7 +225,7 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
                 is_unix = true;
                 socket_path = stripped.to_string();
             }
-            
+
             if is_unix {
                 if !socket_path.starts_with('/') {
                     socket_path = format!("/{}", socket_path);
@@ -281,8 +287,9 @@ async fn dynamic_handler(State(state): State<AppState>, req: Request) -> Respons
 
             match builder.send().await {
                 Ok(resp) => {
-                    tracing::info!("✅ [Reverse Proxy] Successfully received response from target (Status: {})", resp.status());
+                    tracing::debug!("✅ [Reverse Proxy] Successfully received response from target (Status: {})", resp.status());
                     let mut res_builder = axum::response::Response::builder().status(resp.status());
+    
                     for (k, v) in resp.headers() {
                         res_builder = res_builder.header(k.clone(), v.clone());
                     }
@@ -430,7 +437,7 @@ async fn handle_unix_reverse_proxy(socket_path: &str, req: Request, client_ip_st
         parts.headers.insert("X-Forwarded-Server", hv.clone());
         parts.headers.insert(axum::http::header::HOST, hv);
     }
-    
+
     for (k, v) in &route.extra {
         let mut v_replaced = v.clone();
         if v_replaced.contains("{client_ip}") {
@@ -449,7 +456,7 @@ async fn handle_unix_reverse_proxy(socket_path: &str, req: Request, client_ip_st
     tracing::debug!("📨 [Unix Proxy] Sending request to unix socket backend...");
     let res = match tokio::time::timeout(std::time::Duration::from_secs(30), sender.send_request(req)).await {
         Ok(Ok(r)) => {
-            tracing::info!("✅ [Unix Proxy] Received response from backend (Status: {})", r.status());
+            tracing::debug!("✅ [Unix Proxy] Received response from backend (Status: {})", r.status());
             r
         },
         Ok(Err(e)) => return Err(format!("Unix request error: {}", e)),
@@ -461,4 +468,3 @@ async fn handle_unix_reverse_proxy(socket_path: &str, req: Request, client_ip_st
     
     Ok(axum::http::Response::from_parts(res_parts, body))
 }
-

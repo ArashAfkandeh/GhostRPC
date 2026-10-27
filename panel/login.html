@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>GhostRPC</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/i18n.js"></script>
+</head>
+<body class="has-glow">
+  <div class="login-tools">
+    <button class="btn ghost sm" id="lang-btn" type="button" data-i18n-title="switch_lang"></button>
+    <button class="btn ghost icon sm" id="theme-btn" type="button" data-i18n-title="switch_theme" aria-label="theme"></button>
+  </div>
+  <main class="login-wrap">
+    <form class="login-card" id="form" autocomplete="on">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+          <defs>
+            <linearGradient id="ghost-mark-bg" x1="5" y1="3" x2="43" y2="46" gradientUnits="userSpaceOnUse"><stop stop-color="#253b60"/><stop offset="1" stop-color="#101827"/></linearGradient>
+            <linearGradient id="ghost-mark" x1="15" y1="9" x2="34" y2="38" gradientUnits="userSpaceOnUse"><stop stop-color="#d8e5ff"/><stop offset="1" stop-color="#83a6ff"/></linearGradient>
+          </defs>
+          <rect x="1" y="1" width="46" height="46" rx="15" fill="url(#ghost-mark-bg)" stroke="#425a80" stroke-width="1.5"/>
+          <path d="M5 24h7m24 0h7" stroke="#4fd8b4" stroke-linecap="round" stroke-width="2.5"/>
+          <circle cx="5" cy="24" r="2" fill="#4fd8b4"/><circle cx="43" cy="24" r="2" fill="#4fd8b4"/>
+          <path d="M24 9.5c-6 0-9.5 4.3-9.5 9.8v14.8l3.8-2.7 3.8 2.7 3.8-2.7 3.8 2.7 3.8-2.7V19.3c0-5.5-3.5-9.8-9.5-9.8Z" fill="url(#ghost-mark)" stroke="#eff4ff" stroke-linejoin="round" stroke-width="1.2"/>
+          <circle cx="20.5" cy="20" r="1.55" fill="#18243a"/><circle cx="27.5" cy="20" r="1.55" fill="#18243a"/>
+          <path d="M20 25.5h8" stroke="#18243a" stroke-linecap="round" stroke-width="1.6"/>
+        </svg>
+        <div>
+          <h1>GhostRPC</h1>
+          <p data-i18n="login_sub"></p>
+        </div>
+      </div>
+      <div class="form-error hidden" id="err" role="alert"></div>
+      <div class="field">
+        <label for="u" data-i18n="username"></label>
+        <input class="input" id="u" name="username" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" required maxlength="64" dir="ltr">
+      </div>
+      <div class="field">
+        <label for="p" data-i18n="password"></label>
+        <div class="pw-row">
+          <input class="input" id="p" name="password" type="password" autocomplete="current-password" required maxlength="256" dir="ltr">
+          <button class="btn ghost icon" id="pw-toggle" type="button" data-i18n-title="show_password" aria-label="toggle password"></button>
+        </div>
+      </div>
+      <button class="btn primary block" id="submit" type="submit"><span data-i18n="sign_in"></span></button>
+    </form>
+  </main>
+  <script src="/assets/modules/login.js"></script>
+</body>
+</html>

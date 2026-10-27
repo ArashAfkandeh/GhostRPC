@@ -102,6 +102,22 @@ static LOCATIONS: OnceLock<RwLock<HashMap<String, u32>>> = OnceLock::new();
 static LOC_EWMA: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone)]
+struct ReverseCleanIpSnapshot {
+    sni: String,
+    location: Option<String>,
+    configured_ips: Vec<String>,
+    scanned_ips: Arc<tokio::sync::RwLock<Vec<String>>>,
+    scanner_running: bool,
+    cancel: CancellationToken,
+}
+
+static REVERSE_CLEAN_IPS: OnceLock<RwLock<Vec<ReverseCleanIpSnapshot>>> = OnceLock::new();
+
+fn reverse_clean_ips() -> &'static RwLock<Vec<ReverseCleanIpSnapshot>> {
+    REVERSE_CLEAN_IPS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
 struct Parked {
     id: u64,
     take: oneshot::Sender<oneshot::Sender<(SendStream<Bytes>, RecvStream)>>,
@@ -327,12 +343,25 @@ pub fn sni_matches(sni: &str) -> bool {
 
 /// True when at least one parked reverse stream is available (used by pool warm-up).
 pub fn has_ready_slot() -> bool {
-    parked().lock().unwrap().values().any(|q| !q.is_empty())
-        || ws_sessions()
-            .lock()
-            .unwrap()
-            .values()
-            .any(|v| v.iter().any(|s| s.mux.alive()))
+    let h2_ready = {
+        let mut groups = parked().lock().unwrap();
+        groups.retain(|_, queue| retain_live_parked(queue));
+        groups.values().any(|queue| !queue.is_empty())
+    };
+    let wss_ready = {
+        let mut groups = ws_sessions().lock().unwrap();
+        groups.retain(|_, sessions| {
+            sessions.retain(|session| session.mux.alive());
+            !sessions.is_empty()
+        });
+        groups.values().any(|sessions| !sessions.is_empty())
+    };
+    h2_ready || wss_ready
+}
+
+fn retain_live_parked(queue: &mut VecDeque<Parked>) -> bool {
+    queue.retain(|entry| !entry.take.is_closed());
+    !queue.is_empty()
 }
 
 /// (key, share_sni, ewma_ms) of every parked-stream group that has an idle stream.
@@ -364,6 +393,75 @@ pub fn candidates() -> Vec<(String, Option<u32>, f64)> {
             (loc, share, e)
         })
         .collect()
+}
+
+/// Read-only view for the admin panel: parked reverse streams / WssMux sessions per location.
+pub async fn admin_snapshot() -> serde_json::Value {
+    let ctx = current_ctx();
+    let (locs, groups) = {
+        let locs = locations().read().unwrap().clone();
+        let ew = ewma_map().lock().unwrap().clone();
+        let p = parked().lock().unwrap();
+        let ws = ws_sessions().lock().unwrap();
+        let mut names: Vec<String> = p.keys().cloned().collect();
+        for k in ws.keys() {
+            if !names.contains(k) {
+                names.push(k.clone());
+            }
+        }
+        names.sort();
+        let groups = names
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "location": n,
+                    "parked": p.get(n).map(|q| q.len()).unwrap_or(0),
+                    "wssmux_sessions": ws.get(n).map(|v| v.iter().filter(|s| s.mux.alive()).count()).unwrap_or(0),
+                    "latency_ms": ew.get(n).map(|e| e.round()),
+                    "share_sni": locs.get(n),
+                })
+            })
+            .collect::<Vec<_>>();
+        (locs, groups)
+    };
+    let clean_ip_entries = {
+        let entries = reverse_clean_ips().read().unwrap();
+        entries
+            .iter()
+            .filter(|entry| !entry.cancel.is_cancelled())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut clean_ips = Vec::new();
+    for entry in clean_ip_entries {
+        if entry.cancel.is_cancelled() {
+            continue;
+        }
+        let scanned = entry.scanned_ips.read().await;
+        let mut ips = Vec::with_capacity(entry.configured_ips.len() + scanned.len());
+        for ip in entry.configured_ips.iter().chain(scanned.iter()) {
+            if !ips.contains(ip) {
+                ips.push(ip.clone());
+            }
+        }
+        clean_ips.push(serde_json::json!({
+            "sni": entry.sni,
+            "location": entry.location,
+            "count": ips.len(),
+            "list": ips.into_iter().take(300).collect::<Vec<_>>(),
+            "scanner_running": entry.scanner_running && !entry.cancel.is_cancelled(),
+        }));
+    }
+    let mut known: Vec<String> = locs.keys().cloned().collect();
+    known.sort();
+    serde_json::json!({
+        "enabled": ctx.is_some(),
+        "bind": ctx.as_ref().and_then(|c| c.bind.clone()),
+        "ready": !groups.is_empty(),
+        "groups": groups,
+        "locations": known,
+        "clean_ips": clean_ips,
+    })
 }
 
 fn remove_parked(location: &str, id: u64) {
@@ -560,6 +658,7 @@ where
     };
     if wire == crate::transport::Wire::WsMux {
         if ctx.protocols.contains(&Proto::WssMux) {
+            let _session_guard = crate::metrics::open_session("wssmux", "in", "reverse", peer.to_string());
             crate::wssmux::serve_reverse(tls, peer, &ctx.hidden_path, &ctx.secret).await;
         }
         return;
@@ -582,12 +681,16 @@ where
         }
     };
     let announced = Arc::new(AtomicBool::new(false));
+    let mut session_guard: Option<crate::metrics::SessionGuard> = None;
     while let Some(Ok((req, respond))) = h2.accept().await {
         let ctx = ctx.clone();
-        let announced = announced.clone();
+        let announced_task = announced.clone();
         tokio::spawn(async move {
-            handle_park_request(req, respond, ctx, peer, announced).await;
+            handle_park_request(req, respond, ctx, peer, announced_task).await;
         });
+        if session_guard.is_none() && announced.load(Ordering::Relaxed) {
+            session_guard = Some(crate::metrics::open_session("h2", "in", "reverse", peer.to_string()));
+        }
     }
 }
 
@@ -655,7 +758,7 @@ async fn handle_park_request(
         .or_default()
         .push_back(Parked { id, take: take_tx });
     if !announced.swap(true, Ordering::Relaxed) {
-        info!(
+        debug!(
             "🔁 Reverse tunnel connection from {} registered{}",
             peer,
             if location.is_empty() {
@@ -721,7 +824,9 @@ fn build_connector() -> TlsConnector {
 }
 
 struct DialerArgs {
-    addrs: Vec<String>,
+    configured_addrs: Vec<String>,
+    scanned_ips: Arc<tokio::sync::RwLock<Vec<String>>>,
+    default_port: u16,
     label: String,
     sni: String,
     name: rustls::pki_types::ServerName<'static>,
@@ -732,6 +837,13 @@ struct DialerArgs {
     connector: TlsConnector,
     /// Protocol priority (`[server].protocols`).
     protos: Vec<Proto>,
+}
+
+impl DialerArgs {
+    async fn addresses(&self) -> Vec<String> {
+        let scanned_ips = self.scanned_ips.read().await;
+        merge_candidate_addrs(&self.configured_addrs, &scanned_ips, self.default_port)
+    }
 }
 
 /// "domain:port" -> (domain, Some(port)); anything else -> (input, None).
@@ -770,6 +882,77 @@ fn host_of(addr: &str) -> String {
         .unwrap_or_else(|| addr.to_string())
 }
 
+fn merge_candidate_addrs(configured: &[String], scanned_ips: &[String], default_port: u16) -> Vec<String> {
+    let mut addrs = Vec::with_capacity(configured.len() + scanned_ips.len());
+    for addr in configured.iter().chain(scanned_ips) {
+        let normalized = normalize_addr(addr, default_port);
+        if !addrs.contains(&normalized) {
+            addrs.push(normalized);
+        }
+    }
+    addrs
+}
+
+fn legacy_reverse_cache_path(index: usize, sni: &str, location: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    index.hash(&mut hasher);
+    sni.hash(&mut hasher);
+    location.unwrap_or_default().hash(&mut hasher);
+    let exe_dir = std::env::current_exe()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .to_path_buf();
+    exe_dir
+        .join("ips")
+        .join("reverse_clean_ips")
+        .join(format!("{:016x}.txt", hasher.finish()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn reverse_scan_paths() -> (String, String) {
+    let exe_dir = std::env::current_exe()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .to_path_buf();
+    let ips_dir = exe_dir.join("ips");
+    let cache = ips_dir.join("clean_ips.txt").to_string_lossy().into_owned();
+    let ranges = ips_dir
+        .join("cloudflare_ip_ranges.txt")
+        .to_string_lossy()
+        .into_owned();
+    (cache, ranges)
+}
+
+fn reverse_scan_remote(r: &crate::config::ReverseDialConfig) -> Option<crate::config::RemoteLocation> {
+    let sni = r
+        .sni
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            r.clean_ip.first().map(|ip| {
+                let normalized = normalize_addr(ip, 443);
+                host_of(&normalized)
+            })
+        })?;
+    let (host, _) = split_host_port(&sni);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(crate::config::RemoteLocation {
+        location: r.location.clone().unwrap_or_default(),
+        sni: vec![sni],
+        port_mappings: Vec::new(),
+        share_sni: None,
+    })
+}
+
 /// Spawns the reverse dialers configured in `[[server.reverse]]` (no-op when absent).
 /// `secret` and `hidden_path` always come from the enclosing `[server]` section.
 pub fn spawn_dialers(cfg: &ServerConfig, cancel: CancellationToken) {
@@ -784,6 +967,136 @@ pub fn spawn_dialers(cfg: &ServerConfig, cancel: CancellationToken) {
     let bind_port = cfg.bind_addr.rsplit(':').next().unwrap_or("").to_string();
     let connector = build_connector();
     let protos = crate::transport::parse_list(cfg.protocols.as_ref(), "server");
+    if cfg.check_interval_minutes == Some(0) {
+        warn!("⚠️ [server].check_interval_minutes must be at least 1; using 1 minute.");
+    }
+    let check_interval_minutes = cfg.check_interval_minutes.unwrap_or(60).max(1);
+    let max_ping_ms = cfg.max_ping_ms.unwrap_or(150).max(1);
+    let scan_remotes = list
+        .iter()
+        .filter_map(reverse_scan_remote)
+        .fold(Vec::new(), |mut remotes, remote| {
+            if !remotes.iter().any(|existing: &crate::config::RemoteLocation| {
+                existing.sni == remote.sni && existing.location == remote.location
+            }) {
+                remotes.push(remote);
+            }
+            remotes
+        });
+    let configured_ips = list
+        .iter()
+        .flat_map(|entry| entry.clean_ip.iter().map(|ip| ip.trim()))
+        .filter(|ip| !ip.is_empty())
+        .fold(Vec::new(), |mut ips: Vec<String>, ip| {
+            if !ips.iter().any(|existing| existing == ip) {
+                ips.push(ip.to_string());
+            }
+            ips
+        });
+    let (scanner_cache, shared_scanned_ips) = if scan_remotes.is_empty() {
+        (
+            None,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        )
+    } else {
+        let (cache_file, source_ips_file) = reverse_scan_paths();
+        let mut initial_ips = match std::fs::read_to_string(&cache_file) {
+            Ok(content) => crate::scanner::parse_clean_ips(&content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                tracing::error!(
+                    "Failed to read Reverse clean-IP cache {}: {}",
+                    cache_file,
+                    error
+                );
+                Vec::new()
+            }
+        };
+        let mut migrated_legacy = false;
+        for (index, entry) in list.iter().enumerate() {
+            let Some(remote) = reverse_scan_remote(entry) else {
+                continue;
+            };
+            let legacy_path =
+                legacy_reverse_cache_path(index, &remote.sni[0], entry.location.as_deref());
+            match std::fs::read_to_string(&legacy_path) {
+                Ok(content) => {
+                    for ip in crate::scanner::parse_clean_ips(&content) {
+                        if !initial_ips.contains(&ip) {
+                            initial_ips.push(ip);
+                        }
+                    }
+                    migrated_legacy = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::error!(
+                    "Failed to read legacy Reverse clean-IP cache {}: {}",
+                    legacy_path,
+                    error
+                ),
+            }
+        }
+        if migrated_legacy {
+            if let Some(parent) = std::path::Path::new(&cache_file).parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    tracing::error!(
+                        "Failed to create Reverse clean-IP cache directory {}: {}",
+                        parent.display(),
+                        error
+                    );
+                } else if let Err(error) =
+                    std::fs::write(&cache_file, initial_ips.join("\n") + "\n")
+                {
+                    tracing::error!(
+                        "Failed to migrate Reverse clean-IP cache to {}: {}",
+                        cache_file,
+                        error
+                    );
+                }
+            }
+        }
+        let shared_scanned_ips = Arc::new(tokio::sync::RwLock::new(initial_ips));
+        let scanner = crate::scanner::Scanner::new(
+            cache_file.clone(),
+            source_ips_file,
+            check_interval_minutes,
+            max_ping_ms,
+            shared_scanned_ips.clone(),
+            scan_remotes,
+            Arc::new(connector.clone()),
+            None,
+            cfg.hidden_path.clone(),
+            secret.clone(),
+            protos.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .require_all_remotes();
+        info!(
+            "🛰️ Reverse clean-IP scanner enabled for {} domain(s) (cache: {})",
+            list.iter().filter(|entry| reverse_scan_remote(entry).is_some()).count(),
+            cache_file
+        );
+        scanner.start(cancel.clone());
+        (Some(cache_file), shared_scanned_ips)
+    };
+
+    let mut snapshots = reverse_clean_ips().write().unwrap();
+    snapshots.retain(|entry| !entry.cancel.is_cancelled());
+    snapshots.push(ReverseCleanIpSnapshot {
+        sni: list
+            .iter()
+            .filter_map(|entry| reverse_scan_remote(entry).map(|remote| remote.sni[0].clone()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        location: None,
+        configured_ips: configured_ips.clone(),
+        scanned_ips: shared_scanned_ips.clone(),
+        scanner_running: scanner_cache.is_some(),
+        cancel: cancel.clone(),
+    });
+    drop(snapshots);
 
     for r in list {
         let (sni_host, sni_port) = match r.sni.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -826,11 +1139,29 @@ pub fn spawn_dialers(cfg: &ServerConfig, cancel: CancellationToken) {
                 "⚠️ [[server.reverse]]: no domain to use as SNI/Host (only IPs given). Behind a CDN set `sni` to the proxied domain."
             );
         }
+        let (scanner_host, _) = split_host_port(&sni);
+        let scanner_host = scanner_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let scanned_ips = if scanner_cache.is_some()
+            && !scanner_host.is_empty()
+            && scanner_host.parse::<std::net::IpAddr>().is_err()
+        {
+            shared_scanned_ips.clone()
+        } else {
+            Arc::new(tokio::sync::RwLock::new(Vec::new()))
+        };
+        let cached_scanned_ips = scanned_ips
+            .try_read()
+            .map(|ips| ips.clone())
+            .unwrap_or_default();
+        let candidate_addrs = merge_candidate_addrs(&addrs, &cached_scanned_ips, default_port);
         let conns = r.pool_size.unwrap_or(8).max(1);
         info!(
-            "🔁 Reverse dialer: {} -> [{}] ({} connection(s) x {} ready streams, protocols: {}{})",
+            "🔁 Reverse dialer: {} -> [{}] ({} clean-IP candidate(s), {} connection(s) x {} ready streams, protocols: {}{}{})",
             sni,
-            addrs.join(", "),
+            candidate_addrs.join(", "),
+            candidate_addrs.len(),
             conns,
             PARKED_PER_CONN,
             protos
@@ -841,11 +1172,17 @@ pub fn spawn_dialers(cfg: &ServerConfig, cancel: CancellationToken) {
             r.location
                 .as_ref()
                 .map(|l| format!(", location '{}'", l))
+                .unwrap_or_default(),
+            scanner_cache
+                .as_ref()
+                .map(|_| ", clean-IP scanning enabled")
                 .unwrap_or_default()
         );
         for idx in 0..conns {
             let a = Arc::new(DialerArgs {
-                addrs: addrs.clone(),
+                configured_addrs: addrs.clone(),
+                scanned_ips: scanned_ips.clone(),
+                default_port,
                 label: sni.clone(),
                 sni: sni.clone(),
                 name: name.clone(),
@@ -874,8 +1211,9 @@ async fn connect_h2(
 ) -> Result<(h2::client::SendRequest<Bytes>, CancellationToken), String> {
     // Race every candidate address (clean CDN IPs / domains); the first TCP connection wins.
     use futures::stream::{FuturesUnordered, StreamExt};
+    let addrs = a.addresses().await;
     let mut tasks = FuturesUnordered::new();
-    for addr in &a.addrs {
+    for addr in &addrs {
         tasks.push(async move {
             crate::anti_loop::safe_connect(addr.as_str(), Duration::from_secs(5)).await
         });
@@ -950,6 +1288,7 @@ async fn conn_manager(a: Arc<DialerArgs>, cancel: CancellationToken) {
                 Proto::H2 => match connect_h2(&a).await {
                     Ok((client, dead)) => {
                         debug!("🔁 Reverse H2 connection for {} established", a.label);
+                        let _session_guard = crate::metrics::open_session("h2", "out", "reverse", a.label.clone());
                         let healthy = Arc::new(AtomicBool::new(false));
                         for _ in 0..PARKED_PER_CONN {
                             tokio::spawn(parker(
@@ -969,17 +1308,14 @@ async fn conn_manager(a: Arc<DialerArgs>, cancel: CancellationToken) {
                         }
                         healthy.load(Ordering::Relaxed)
                     }
-                    Err(e) => {
-                        crate::net_utils::log_rate_limited(
-                            &format!("rev_dial_{}", a.label),
-                            &format!("⚠️ Reverse dial (h2) for {} failed: {}", a.label, e),
-                        );
+                    Err(_) => {
                         false
                     }
                 },
                 Proto::WssMux => {
+                    let addrs = a.addresses().await;
                     let dial = crate::wssmux::ReverseDial {
-                        addrs: &a.addrs,
+                        addrs: &addrs,
                         sni: &a.sni,
                         location: a.location.as_deref(),
                         secret: &a.secret,
@@ -989,6 +1325,7 @@ async fn conn_manager(a: Arc<DialerArgs>, cancel: CancellationToken) {
                     match crate::wssmux::dial_reverse(&dial, cancel.clone()).await {
                         Ok(session) => {
                             debug!("🔁 Reverse WssMux session for {} established", a.label);
+                            let _session_guard = crate::metrics::open_session("wssmux", "out", "reverse", a.label.clone());
                             let t0 = tokio::time::Instant::now();
                             tokio::select! {
                                 _ = session.dead.cancelled() => {}
@@ -997,11 +1334,7 @@ async fn conn_manager(a: Arc<DialerArgs>, cancel: CancellationToken) {
                             // A session that dies at once never carried anything: treat as failed.
                             t0.elapsed() > Duration::from_secs(5)
                         }
-                        Err(e) => {
-                            crate::net_utils::log_rate_limited(
-                                &format!("rev_dial_ws_{}", a.label),
-                                &format!("⚠️ Reverse dial (wssmux) for {} failed: {}", a.label, e),
-                            );
+                        Err(_) => {
                             false
                         }
                     }
@@ -1013,16 +1346,6 @@ async fn conn_manager(a: Arc<DialerArgs>, cancel: CancellationToken) {
                 break;
             }
             crate::transport::record_fail(&a.label, proto);
-            if a.protos.len() > 1 {
-                crate::net_utils::log_rate_limited(
-                    &format!("rev_switch_{}_{}", a.label, proto.name()),
-                    &format!(
-                        "🔀 Reverse {}: protocol {} is unavailable, switching to the next one",
-                        a.label,
-                        proto.name()
-                    ),
-                );
-            }
         }
         backoff_ms = if served && started.elapsed() > Duration::from_secs(5) {
             300
@@ -1159,13 +1482,6 @@ async fn parker(
             }
             ParkEnd::Drained | ParkEnd::ConnDead => return,
             ParkEnd::BadStatus(code) => {
-                crate::net_utils::log_rate_limited(
-                    &format!("rev_status_{}_{}", a.label, code),
-                    &format!(
-                        "⚠️ Reverse request for {} was answered with HTTP {} (secret/hidden_path mismatch, or CDN/gRPC setting?)",
-                        a.label, code
-                    ),
-                );
                 // 503 only means "the client is at its parked-stream limit": not a protocol problem.
                 if code != 503 && !healthy.load(Ordering::Relaxed) {
                     early_fails += 1;
@@ -1294,6 +1610,7 @@ async fn serve_assigned(mut asg: Assigned, a: Arc<DialerArgs>) {
         let _ = asg.send.send_data(Bytes::new(), true);
         return;
     }
+    let _stream_guard = crate::metrics::open_stream("tunnel", "h2", format!("reverse:{}", a.label), asg.target.clone());
     let (mut target_read, mut target_write) = tcp.unwrap().into_split();
     let mut send = asg.send;
 
@@ -1338,6 +1655,7 @@ async fn serve_assigned(mut asg: Assigned, a: Arc<DialerArgs>) {
         match body.data().await {
             Some(Ok(chunk)) => {
                 let _ = body.flow_control().release_capacity(chunk.len());
+                crate::metrics::add_rx(chunk.len());
                 buf.extend_from_slice(&chunk);
             }
             _ => break,
@@ -1395,6 +1713,49 @@ mod tests {
     }
 
     #[test]
+    fn reverse_dial_candidates_keep_configured_addresses_and_deduplicate_scanned_ips() {
+        let configured = vec!["104.16.1.1:2083".to_string(), "origin.example.com:2083".to_string()];
+        let scanned = vec!["104.16.1.1".to_string(), "104.17.2.2".to_string()];
+        assert_eq!(
+            merge_candidate_addrs(&configured, &scanned, 2083),
+            vec![
+                "104.16.1.1:2083".to_string(),
+                "origin.example.com:2083".to_string(),
+                "104.17.2.2:2083".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reverse_scanner_uses_one_shared_cache_with_client_names() {
+        let (single_cache, single_ranges) = reverse_scan_paths();
+        assert_eq!(
+            std::path::Path::new(&single_cache)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("clean_ips.txt")
+        );
+        assert_eq!(
+            std::path::Path::new(&single_ranges)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("cloudflare_ip_ranges.txt")
+        );
+        assert_eq!(
+            std::path::Path::new(&single_cache).parent(),
+            std::path::Path::new(&single_ranges).parent()
+        );
+        assert_eq!(single_cache, reverse_scan_paths().0);
+    }
+
+    #[test]
+    fn legacy_reverse_cache_paths_remain_separate_for_migration() {
+        let first = legacy_reverse_cache_path(0, "one.example.com:443", None);
+        let second = legacy_reverse_cache_path(1, "two.example.com:443", None);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn constant_time_eq() {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
@@ -1418,5 +1779,28 @@ mod tests {
             Some(Proto::WssMux)
         );
         assert_eq!(preferred_available_protocol(&order, false, false), None);
+    }
+
+    #[test]
+    fn reverse_health_ignores_closed_h2_stream_channels() {
+        let (live_tx, _live_rx) = oneshot::channel();
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        let mut queue = VecDeque::from([
+            Parked {
+                id: 1,
+                take: live_tx,
+            },
+            Parked {
+                id: 2,
+                take: dead_tx,
+            },
+        ]);
+
+        assert!(retain_live_parked(&mut queue));
+        assert_eq!(queue.len(), 1);
+
+        drop(queue);
+        assert!(!retain_live_parked(&mut VecDeque::new()));
     }
 }

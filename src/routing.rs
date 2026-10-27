@@ -9,13 +9,14 @@ pub fn parse_port_mappings(mappings: &[String], location: Option<&str>, routes: 
         let (left, right) = if let Some(idx) = m.find('=') {
             (&m[..idx], &m[idx+1..])
         } else if let Some(idx) = m.rfind(':') {
+        
             (&m[..idx], &m[idx+1..])
         } else {
             continue;
         };
         let right = right.trim().to_string();
         let left = left.trim();
-        
+
         let mut bind_ip = "0.0.0.0".to_string();
         let mut sni_rule = None;
         let mut start_port = 0;
@@ -58,6 +59,7 @@ pub fn parse_port_mappings(mappings: &[String], location: Option<&str>, routes: 
         let mut target_end = 0;
         let right_parts: Vec<&str> = right.split(':').collect();
         let is_right_range = right_parts.len() == 2 && right_parts[0].parse::<u16>().is_ok() && right_parts[1].parse::<u16>().is_ok();
+            
         
         if is_right_range {
             target_start = right_parts[0].parse::<u16>().unwrap();
@@ -68,7 +70,7 @@ pub fn parse_port_mappings(mappings: &[String], location: Option<&str>, routes: 
             let current_port = start_port + i;
             let bind_addr = format!("{}:{}", bind_ip, current_port);
             let route = routes.entry(bind_addr).or_default();
-            
+
             let current_right = if is_right_range {
                 let tp = std::cmp::min(target_start + i, target_end);
                 tp.to_string()
@@ -82,6 +84,7 @@ pub fn parse_port_mappings(mappings: &[String], location: Option<&str>, routes: 
                 route.default_upstream = Some(current_right.clone());
             }
             if let Some(loc) = location {
+        
                 route.target_locations.insert(current_right, loc.to_string());
             }
         }
@@ -97,7 +100,7 @@ pub fn parse_server_sni_proxy(
 
     for cfg in configs {
         let target_str = cfg.target.join(",");
-        
+
         for incoming in &cfg.incoming_sni {
             let mut sni = incoming.clone();
             let mut port = default_port;
@@ -161,6 +164,7 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
         let ext_size = ((buf[pos + 2] as usize) << 8) | (buf[pos + 3] as usize);
         pos += 4;
 
+    
         if ext_type == 0x0000 { // SNI Extension
             if pos + 2 > ext_end { return None; }
             let sni_list_len = ((buf[pos] as usize) << 8) | (buf[pos + 1] as usize);
@@ -174,24 +178,29 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
                 if name_type == 0x00 { // Hostname
                     if sni_pos + name_len <= list_end {
                         if let Ok(sni) = std::str::from_utf8(&buf[sni_pos..sni_pos + name_len]) {
+    
                             return Some(sni.to_string());
                         }
                     }
                     break;
                 }
                 sni_pos += name_len;
+    
             }
             break;
         }
         pos += ext_size;
+        
     }
     None
 }
 
+        
 pub fn is_http_request(buf: &[u8]) -> bool {
     let methods: &[&[u8]] = &[
         b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", 
         b"DELETE ", b"PATCH ", b"TRACE ", b"CONNECT "
+                
     ];
     for &m in methods {
         if buf.starts_with(m) {
@@ -205,7 +214,7 @@ pub fn extract_http_host(buf: &[u8]) -> Option<String> {
     if !is_http_request(buf) {
         return None;
     }
-    
+
     let mut host_start = None;
     for i in 0..buf.len().saturating_sub(6) {
         if buf[i] == b'\n' {
@@ -219,26 +228,26 @@ pub fn extract_http_host(buf: &[u8]) -> Option<String> {
             }
         }
     }
-    
+
     // Check if the very first line is Host: (rare, but valid in some tests)
     if host_start.is_none() && buf.len() >= 5 && buf[0..5].eq_ignore_ascii_case(b"Host:") {
         host_start = Some(5);
     }
-    
+
     if let Some(mut start) = host_start {
         while start < buf.len() && (buf[start] == b' ' || buf[start] == b'\t') {
             start += 1;
         }
-        
+
         let mut end = start;
         while end < buf.len() && buf[end] != b'\r' && buf[end] != b'\n' {
             end += 1;
         }
-        
+
         if end > start {
             if let Ok(host_val) = std::str::from_utf8(&buf[start..end]) {
                 let mut host = host_val.trim().to_string();
-                
+
                 // Strip port if present
                 if let Some(colon_idx) = host.rfind(':') {
                     let num_colons = host.chars().filter(|c| *c == ':').count();

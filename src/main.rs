@@ -1,6 +1,9 @@
 mod acme;
+mod admin;
+mod certinfo;
 mod client;
 mod config;
+mod metrics;
 mod scanner;
 
 mod dynamic_proxy;
@@ -25,6 +28,7 @@ use server::run_server;
 use std::{fs, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 // ==========================================
@@ -39,43 +43,93 @@ async fn gather_and_provision_acme(
     web_server: Option<&Vec<crate::config::WebServerConfig>>,
     copy_certs_to: Option<&Vec<String>>,
 ) -> bool {
-    let mut all_snis = Vec::new();
+    let mut configured_snis = Vec::new();
     if let Some(snis) = tunnel_sni {
-        all_snis.extend(snis.clone());
+        configured_snis.extend(snis.clone());
     }
     if let Some(ws_configs) = web_server {
         for ws in ws_configs {
             if let Some(domain) = ws.domain.split(':').next() {
-                all_snis.push(domain.to_string());
+                configured_snis.push(domain.to_string());
             }
         }
     }
-    if all_snis.is_empty() {
+    let mut domains_to_resolve = Vec::new();
+    for domain in configured_snis {
+        if let Some(zone) = crate::acme::valid_certificate_zone_for_domain(&domain) {
+            crate::acme::copy_existing_certs(&zone, copy_certs_to);
+        } else {
+            domains_to_resolve.push(domain);
+        }
+    }
+
+    for zone in crate::acme::existing_cert_zone_names() {
+        if crate::acme::needs_renewal(&zone) {
+            domains_to_resolve.push(zone);
+        } else {
+            crate::acme::copy_existing_certs(&zone, copy_certs_to);
+        }
+    }
+    domains_to_resolve.sort_by_key(|domain| domain.to_ascii_lowercase());
+    domains_to_resolve.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if domains_to_resolve.is_empty() {
         return false;
     }
 
     let mut renewed = false;
-    if let Ok(zones) = crate::acme::extract_zone_names(cf_token, arvan_token, &all_snis).await {
+    if let Ok(zones) =
+        crate::acme::extract_zone_names(cf_token, arvan_token, &domains_to_resolve).await
+    {
         for zone in zones {
-            if crate::acme::needs_renewal(&zone) {
+            if crate::acme::needs_renewal(&zone.name) {
                 tracing::info!(
                     "🔄 Certificate for {} needs renewal. Starting ACME...",
-                    zone
+                    zone.name
                 );
                 if let Err(e) =
-                    crate::acme::provision_acme_cert(cf_token, arvan_token, &zone, copy_certs_to)
-                        .await
+                    crate::acme::provision_acme_cert(
+                        cf_token,
+                        arvan_token,
+                        &zone.name,
+                        zone.provider,
+                        copy_certs_to,
+                    )
+                    .await
                 {
-                    tracing::error!("❌ ACME Provisioning failed for zone {}: {}", zone, e);
+                    tracing::error!(
+                        "❌ ACME Provisioning failed for zone {}: {}",
+                        zone.name,
+                        e
+                    );
                 } else {
                     renewed = true;
                 }
             } else {
-                crate::acme::copy_existing_certs(&zone, copy_certs_to);
+                crate::acme::copy_existing_certs(&zone.name, copy_certs_to);
             }
         }
     }
     renewed
+}
+
+/// Starts, restarts or stops the admin panel so it matches the `[admin]` section of the config.
+fn sync_admin(
+    current: &mut Option<(config::AdminConfig, CancellationToken)>,
+    wanted: Option<&config::AdminConfig>,
+    config_path: &str,
+) {
+    let wanted = wanted.filter(|a| a.enabled);
+    if current.as_ref().map(|(c, _)| c) == wanted {
+        return;
+    }
+    if let Some((_, old)) = current.take() {
+        old.cancel();
+    }
+    if let Some(cfg) = wanted {
+        let token = CancellationToken::new();
+        tokio::spawn(admin::run(cfg.clone(), config_path.to_string(), token.clone()));
+        *current = Some((cfg.clone(), token));
+    }
 }
 
 fn resolve_file_path(path_str: &str, default_filename: &str) -> String {
@@ -123,9 +177,17 @@ async fn main() {
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config_path = std::env::args()
-        .nth(1)
+    metrics::mark_start();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config_path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "config.toml".to_string());
+    // `GhostRPC config.toml --reset-admin-password`: new random admin-panel password, then exit.
+    if args.iter().any(|a| a == "--reset-admin-password") {
+        std::process::exit(admin::cli_reset_password(&config_path));
+    }
 
     let initial_content = fs::read_to_string(&config_path).expect("Failed to read config");
     let initial_config: AppConfig = toml::from_str(&initial_content).unwrap();
@@ -145,7 +207,7 @@ async fn main() {
                 .as_ref()
                 .and_then(|s| s.log_level.clone())
         })
-        .unwrap_or_else(|| "info".to_string());
+        .unwrap_or_else(|| "warn".to_string());
 
     let filter_str = format!(
         "h2=warn,rustls=warn,tokio_rustls=warn,GhostRPC={}",
@@ -153,10 +215,11 @@ async fn main() {
     );
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_str));
-    fmt()
-        .with_env_filter(env_filter)
-        .with_thread_ids(true)
-        .with_target(false)
+    // The extra `LogLayer` mirrors the log lines into a ring buffer shown by the admin panel.
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer().with_target(false))
+        .with(metrics::LogLayer)
         .init();
 
     info!("🚀 Starting GhostRPC with SNI Routing & Hot-Reload");
@@ -168,11 +231,16 @@ async fn main() {
     let mut last_hash = hasher.finish();
     let mut current_cancel_token = CancellationToken::new();
 
+    // Built-in admin panel (`[admin]`): lives across hot-reloads, restarted only when its own section changes.
+    let mut current_admin: Option<(config::AdminConfig, CancellationToken)> = None;
+    sync_admin(&mut current_admin, initial_config.admin.as_ref(), &config_path);
+
     let token = current_cancel_token.clone();
     let cfg_initial = initial_config.clone();
     let config_path_main = config_path.clone();
     let _ = tokio::spawn(async move {
         if let Some(server_cfg) = cfg_initial.server {
+            metrics::set_role("server");
             if server_cfg.cloudflare_api_token.is_some()
                 || server_cfg.arvancloud_api_token.is_some()
             {
@@ -212,6 +280,7 @@ async fn main() {
             )
             .await;
         } else if let Some(mut client_cfg) = cfg_initial.client {
+            metrics::set_role("client");
             if !client_cfg.remotes.is_empty() {
                 client_cfg.clean_ip_file = Some(resolve_file_path(
                     &client_cfg.clean_ip_file.clone().unwrap_or_default(),
@@ -285,6 +354,7 @@ async fn main() {
                                 error!("❌ Neither [server] nor [client] configuration found! Ignoring hot-reload.");
                                 continue;
                             }
+                            sync_admin(&mut current_admin, new_config.admin.as_ref(), &config_path);
                             let token_new = CancellationToken::new();
                             let token_new_clone = token_new.clone();
                             let config_path_clone_reload = config_path.clone();
@@ -292,6 +362,7 @@ async fn main() {
 
                             let _ = tokio::spawn(async move {
                                 if let Some(server_cfg) = new_config.server {
+                                    metrics::set_role("server");
                                     if server_cfg.cloudflare_api_token.is_some() || server_cfg.arvancloud_api_token.is_some() {
                                         let cf = server_cfg.cloudflare_api_token.clone();
                                         let arv = server_cfg.arvancloud_api_token.clone();
@@ -309,6 +380,7 @@ async fn main() {
                                     }
                                     run_server(server_cfg, token_new_clone).await;
                                 } else if let Some(mut client_cfg) = new_config.client {
+                                    metrics::set_role("client");
                                     if !client_cfg.remotes.is_empty() {
                                         client_cfg.clean_ip_file = Some(resolve_file_path(&client_cfg.clean_ip_file.clone().unwrap_or_default(), "ips/clean_ips.txt"));
                                         client_cfg.source_ips_file = Some(resolve_file_path(&client_cfg.source_ips_file.clone().unwrap_or_default(), "ips/cloudflare_ip_ranges.txt"));
@@ -352,10 +424,17 @@ async fn main() {
                     }
                 }
             }
+            _ = metrics::reload_notify().notified() => {
+                // Requested from the admin panel: force the next tick to reload even if the file is unchanged.
+                last_hash = 0;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("🛑 Received signal (Ctrl+C). Initiating Graceful Shutdown...");
                 // Signal listeners to stop accepting new connections
                 current_cancel_token.cancel();
+                if let Some((_, t)) = &current_admin {
+                    t.cancel();
+                }
 
                 info!("⏳ Waiting 3 seconds for active connections and pending operations to finish...");
                 tokio::time::sleep(Duration::from_secs(3)).await;

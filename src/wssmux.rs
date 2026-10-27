@@ -43,7 +43,7 @@ use tokio_util::{
     compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt},
     sync::CancellationToken,
 };
-use tracing::{debug, info};
+use tracing::{debug};
 use yamux::{Config as YamuxConfig, Connection, Control, Mode};
 
 /// One tunnel sub-stream (a yamux stream adapted to tokio's I/O traits).
@@ -379,6 +379,8 @@ async fn serve_stream(mut st: MuxStream, bind_port: &str) {
         return;
     }
     let mut tcp = tcp;
+    let _stream_guard = crate::metrics::open_stream("tunnel", "wssmux", "-", target);
+    let mut st = crate::metrics::Counted::new(st);
     let _ = tokio::io::copy_bidirectional_with_sizes(&mut st, &mut tcp, 64 * 1024, 64 * 1024).await;
 }
 
@@ -391,11 +393,12 @@ pub async fn pipe_user(
     local_read: OwnedReadHalf,
     local_write: OwnedWriteHalf,
     initial: &[u8],
-    mut st: MuxStream,
+    st: MuxStream,
 ) {
     let Ok(mut local) = local_read.reunite(local_write) else {
         return;
     };
+    let mut st = crate::metrics::Counted::new(st);
     if !initial.is_empty() && st.write_all(initial).await.is_err() {
         return;
     }
@@ -560,16 +563,18 @@ where
     }
 }
 
-/// IP scanner health check: the full Direct handshake (TLS with ALPN http/1.1, WebSocket upgrade on
-/// `hidden_path` with the secret, Ping/Pong) over an already connected `tcp`.
-pub async fn probe_endpoint(
+/// IP scanner health check: the full tunnel handshake (TLS with ALPN http/1.1, WebSocket upgrade,
+/// authentication, and Ping/Pong) over an already connected `tcp`.
+pub async fn probe_endpoint_with_location(
     tcp: tokio::net::TcpStream,
     sni_host_port: &str,
     sni_host: &str,
     hidden_path: &str,
     secret: &str,
+    location: Option<&str>,
 ) -> Result<Duration, String> {
-    let mut ws = dial_ws(tcp, sni_host_port, sni_host, hidden_path, secret, None).await?;
+    let mut ws =
+        dial_ws(tcp, sni_host_port, sni_host, hidden_path, secret, location).await?;
     let res = probe_ws(&mut ws).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.close(None)).await;
     res
@@ -606,10 +611,6 @@ pub async fn connect_direct(
             rtt.as_millis()
         ),
         Err(e) => {
-            crate::net_utils::log_rate_limited(
-                &format!("ws_probe_{}", node_sni),
-                &format!("⚠️ Direct WssMux to {} rejected: {}", node_sni, e),
-            );
             return Err(e);
         }
     }
@@ -755,7 +756,7 @@ pub async fn serve_reverse<S>(
         drain_on: None,
     };
     let session = start_session(ws, Mode::Server, opts, None);
-    info!(
+    debug!(
         "🔁 Reverse WssMux session from {} registered{}",
         peer,
         if location.is_empty() {

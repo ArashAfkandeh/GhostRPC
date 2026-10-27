@@ -29,6 +29,49 @@ pub struct AppConfig {
     pub log_level: Option<String>,
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
+    /// Built-in web admin panel (login + dashboard). See `[admin]` in server.toml / client.toml.
+    pub admin: Option<AdminConfig>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1:8088".to_string()
+}
+
+/// `[admin]`: the built-in management panel. It listens on its own address (default loopback only)
+/// and is protected by a username/password login. Put it behind TLS with a
+/// `[[server.web_server]]` / `[[client.web_server]]` `reverse_proxy` route when exposing it.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct AdminConfig {
+    /// Set to false to disable the panel without removing the section.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Address the panel listens on. Default: 127.0.0.1:8088 (loopback only).
+    #[serde(default = "default_admin_bind")]
+    pub bind_addr: String,
+    /// Username used when the credentials file is created for the first time (default: admin).
+    pub username: Option<String>,
+    /// Initial password, used ONLY when the credentials file does not exist yet. When omitted a
+    /// random password is generated and printed once in the log. Remove it from the file afterwards.
+    pub password: Option<String>,
+    /// Where the username and the Argon2 password hash are stored (relative paths are resolved next
+    /// to the config file). Default: admin_credentials.json
+    pub credentials_file: Option<String>,
+    /// Idle session lifetime in minutes (default 480, minimum 5).
+    pub session_ttl_minutes: Option<u64>,
+    /// Trust `X-Forwarded-For` / `X-Forwarded-Proto` (enable only behind the built-in reverse proxy
+    /// or another trusted proxy; otherwise clients could spoof their IP and dodge the login limiter).
+    #[serde(default)]
+    pub trust_proxy: bool,
+    /// Force (true) or drop (false) the `Secure` cookie flag. Default: automatic (set when the
+    /// request arrived over HTTPS through a trusted proxy).
+    pub secure_cookie: Option<bool>,
+    /// Read-only mode: the panel can only look, never change the config or run actions.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -54,6 +97,10 @@ pub struct ServerConfig {
     pub tunnel_sni: Option<Vec<String>>,
     pub secret: Option<String>,
     pub copy_certs_to: Option<Vec<String>>,
+    /// Reverse clean-IP scanner interval in minutes (default: 60).
+    pub check_interval_minutes: Option<u64>,
+    /// Maximum TCP probe latency in milliseconds (default: 150).
+    pub max_ping_ms: Option<u64>,
     /// Reverse mode: this server dials OUT to the client (Iran side) in addition to
     /// accepting direct connections. See `[[server.reverse]]` in server.toml.
     #[serde(default)]
@@ -74,6 +121,7 @@ pub struct ReverseDialConfig {
     /// Clean IPs: candidate addresses to connect to: clean CDN IPs (e.g. Cloudflare) and/or domains. Entries
     /// without a port use the port of `sni` (default 443). Every new connection races all of them.
     /// May be omitted when `sni` is a domain (then the domain itself is used).
+    /// With a domain SNI, the server also scans that CDN's ranges and adds healthy IPs automatically.
     #[serde(default)]
     pub clean_ip: Vec<String>,
     /// Domain presented as TLS SNI and HTTP Host, optionally "domain:port" (like Direct's `sni`).
@@ -109,7 +157,7 @@ pub struct ClientConfig {
     /// Direct SNI), "arvancloud" or "cloudflare".
     pub scanner_cdn: Option<String>,
     pub check_interval_minutes: Option<u64>,
-    /// Background tunnel path health check interval in minutes (default: 1).
+    /// Background tunnel path health check interval in minutes (default: 5).
     pub tunnel_health_check_interval_minutes: Option<u64>,
     pub max_ping_ms: Option<u64>,
     pub web_server: Option<Vec<WebServerConfig>>,
@@ -251,8 +299,52 @@ protocols = ["h2"]
     }
 
     #[test]
+    fn admin_section_defaults_and_overrides() {
+        let r: AppConfig = toml::from_str("[server]\n[admin]\n").unwrap();
+        let a = r.admin.unwrap();
+        assert!(a.enabled);
+        assert_eq!(a.bind_addr, "127.0.0.1:8088");
+        assert!(!a.trust_proxy && !a.read_only);
+        assert!(a.password.is_none() && a.session_ttl_minutes.is_none());
+
+        let r: AppConfig = toml::from_str(
+            "[client]\n[admin]\nenabled = false\nbind_addr = \"0.0.0.0:9000\"\ntrust_proxy = true\nread_only = true\nsession_ttl_minutes = 30\n",
+        )
+        .unwrap();
+        let a = r.admin.unwrap();
+        assert!(!a.enabled && a.trust_proxy && a.read_only);
+        assert_eq!(a.bind_addr, "0.0.0.0:9000");
+        assert_eq!(a.session_ttl_minutes, Some(30));
+
+        let r: AppConfig = toml::from_str("[server]\n").unwrap();
+        assert!(r.admin.is_none());
+    }
+
+    #[test]
     fn no_reverse_keys_means_no_acme_domains() {
         let r: Root = toml::from_str("[client]\n").unwrap();
         assert!(r.client.unwrap().acme_domain_list().is_none());
+    }
+
+    #[test]
+    fn server_scanner_settings_are_optional_and_parsed() {
+        let r: Root = toml::from_str(
+            "[server]\ncheck_interval_minutes = 12\nmax_ping_ms = 250\n",
+        )
+        .unwrap();
+        let server = r.server.unwrap();
+        assert_eq!(server.check_interval_minutes, Some(12));
+        assert_eq!(server.max_ping_ms, Some(250));
+
+        let r: Root = toml::from_str("[server]\n").unwrap();
+        let server = r.server.unwrap();
+        assert_eq!(server.check_interval_minutes, None);
+        assert_eq!(server.max_ping_ms, None);
+
+        let r: Root = toml::from_str(
+            "[server]\n[[server.reverse]]\nsni = \"tunnel.example.com\"\n",
+        )
+        .unwrap();
+        assert!(r.server.unwrap().reverse.unwrap()[0].clean_ip.is_empty());
     }
 }

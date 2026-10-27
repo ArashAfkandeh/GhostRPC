@@ -9,7 +9,7 @@ use ipnet::Ipv4Net;
 use rand::RngExt;
 use tokio_rustls::TlsConnector;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// ArvanCloud CDN edge ranges (scanned instead of Cloudflare's when the tunnel SNI is behind Arvan).
 const ARVANCLOUD_RANGES: &[&str] = &[
@@ -131,10 +131,11 @@ fn pick_range(ranges: &[Ipv4Net], weighted: bool) -> &Ipv4Net {
 /// What the strict test needs to speak the same protocol the tunnel will use.
 #[derive(Clone)]
 struct ProbeCfg {
-    /// First protocol in `protocols` is WssMux: test with TLS(http/1.1) + WebSocket upgrade + ping/pong.
-    ws_first: bool,
+    protocols: Vec<crate::transport::Proto>,
     hidden_path: String,
     secret: String,
+    location: Option<String>,
+    require_all_remotes: bool,
 }
 
 pub struct Scanner {
@@ -151,6 +152,9 @@ pub struct Scanner {
     /// CDN detected for the current scan cycle (true = ArvanCloud).
     is_arvan: AtomicBool,
     arvan_ranges_cache: tokio::sync::OnceCell<Vec<Ipv4Net>>,
+    refresh: Arc<tokio::sync::Notify>,
+    generation: Arc<AtomicU64>,
+    cache_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Scanner {
@@ -166,8 +170,10 @@ impl Scanner {
         hidden_path: String,
         secret: String,
         protocols: Vec<crate::transport::Proto>,
+        refresh: Arc<tokio::sync::Notify>,
+        generation: Arc<AtomicU64>,
+        cache_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
-        let ws_first = protocols.first() == Some(&crate::transport::Proto::WssMux) && !secret.is_empty();
         Self {
             clean_ip_file,
             source_ips_file,
@@ -177,13 +183,27 @@ impl Scanner {
             remotes,
             tls_connector,
             cdn_pref,
-            probe: ProbeCfg { ws_first, hidden_path, secret },
+            probe: ProbeCfg {
+                protocols,
+                hidden_path,
+                secret,
+                location: None,
+                require_all_remotes: false,
+            },
             is_arvan: AtomicBool::new(false),
             arvan_ranges_cache: tokio::sync::OnceCell::new(),
+            refresh,
+            generation,
+            cache_lock,
         }
     }
 
-    /// Decides which CDN fronts the Direct tunnel SNI(s): explicit `scanner_cdn`, otherwise the
+    pub fn require_all_remotes(mut self) -> Self {
+        self.probe.require_all_remotes = true;
+        self
+    }
+
+    /// Decides which CDN fronts the tunnel SNI(s): explicit `scanner_cdn`, otherwise the
     /// DNS answers of the SNI domains (an address inside the ArvanCloud / Cloudflare ranges), and
     /// as a last hint the IPs already stored in clean_ips.txt. Unknown = Cloudflare (legacy default).
     async fn detect_cdn(&self, existing: &[String]) -> Cdn {
@@ -338,37 +358,49 @@ impl Scanner {
     }
 
     async fn run_loop(&self) {
-
         loop {
+            let generation = self.generation.load(Ordering::Acquire);
             tracing::debug!("🔍 Starting IP scanner routine...");
             let mut current_ips = self.read_clean_ips().await;
+            tracing::info!(
+                "🛰️ IP scanner: loaded {} clean-IP candidate(s) from {}",
+                current_ips.len(),
+                self.clean_ip_file
+            );
             let cdn = self.detect_cdn(&current_ips).await;
+            let cache_guard = self.cache_lock.lock().await;
+            if generation != self.generation.load(Ordering::Acquire) {
+            
+                drop(cache_guard);
+                continue;
+            }
             self.is_arvan.store(cdn == Cdn::ArvanCloud, Ordering::Relaxed);
-            tracing::info!("🛰️ IP scanner: CDN of the Direct tunnel SNI = {} -> scanning {} edge IP ranges", cdn.name(), cdn.name());
+            tracing::info!("🛰️ IP scanner: CDN of the tunnel SNI = {} -> scanning {} edge IP ranges", cdn.name(), cdn.name());
             
             if !current_ips.is_empty() {
                 let mut w = self.clean_ips_global.write().await;
                 *w = current_ips.clone();
             }
+            drop(cache_guard);
             
             // If empty, try to get 1 IP immediately to warm up the client pool
             if current_ips.is_empty() {
                 tracing::warn!("⚠️ clean_ips is empty, trying to find 1 initial IP for fast startup...");
-                let new_ips = self.find_new_ips(1).await;
+                let new_ips = self.find_new_ips(1, &current_ips).await;
                 if !new_ips.is_empty() {
                     current_ips.extend(new_ips);
-                    self.save_and_update(&current_ips).await;
+                    self.save_and_update(&current_ips, generation).await;
                 }
             }
-            
+
             // If we have less than 10 IPs in total, fill the remaining slots
             if !current_ips.is_empty() && current_ips.len() < 10 {
                 let needed = 10 - current_ips.len();
                 tracing::debug!("🔄 Finding {} more IPs to reach the full pool size of 10...", needed);
-                let new_ips = self.find_new_ips(needed).await;
+                let new_ips = self.find_new_ips(needed, &current_ips).await;
                 if !new_ips.is_empty() {
                     current_ips.extend(new_ips);
-                    self.save_and_update(&current_ips).await;
+                    self.save_and_update(&current_ips, generation).await;
                 }
             }
 
@@ -378,7 +410,7 @@ impl Scanner {
                 let mut healthy_ips = Vec::new();
 
                 for ip in current_ips.iter() {
-                    if self.strict_test_ip(ip).await {
+                    if self.strict_test_ip(ip).await || self.strict_test_ip(ip).await {
                         healthy_ips.push(ip.clone());
                     } else {
                         failed_count += 1;
@@ -388,34 +420,45 @@ impl Scanner {
 
                 if failed_count > 0 {
                     tracing::debug!("🔄 Finding {} new IPs to replace disconnected ones...", failed_count);
-                    let new_ips = self.find_new_ips(failed_count).await;
+                    let new_ips = self.find_new_ips(failed_count, &current_ips).await;
                     healthy_ips.extend(new_ips);
-                    self.save_and_update(&healthy_ips).await;
+                    self.save_and_update(&healthy_ips, generation).await;
                 } else {
                     tracing::debug!("✅ All {} IPs in clean_ips are healthy.", healthy_ips.len());
                 }
             }
 
-            let interval_secs = self.check_interval_minutes * 60;
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            let interval_minutes = if current_ips.len() < 10 {
+                self.check_interval_minutes.min(5).max(1)
+            } else {
+                self.check_interval_minutes.max(1)
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_minutes * 60)) => {}
+                _ = self.refresh.notified() => {}
+            }
         }
     }
 
-    async fn save_and_update(&self, ips: &[String]) {
+    async fn save_and_update(&self, ips: &[String], generation: u64) {
+        let _cache_guard = self.cache_lock.lock().await;
+        if generation != self.generation.load(Ordering::Acquire) {
+            return;
+        }
+        // Keep the last known candidates available when a transient scan/revalidation finds none.
+        let Some(content) = clean_ips_file_content(ips) else {
+            tracing::warn!(
+                "No clean IPs are available; keeping the existing in-memory and on-disk cache at {}",
+                self.clean_ip_file
+            );
+            return;
+        };
+
         // Update memory first
         {
             let mut w = self.clean_ips_global.write().await;
             *w = ips.to_vec();
         }
-
-        // Never destroy a useful on-disk cache when a scan has no healthy results.
-        let Some(content) = clean_ips_file_content(ips) else {
-            tracing::warn!(
-                "No clean IPs are available; keeping the existing cache at {}",
-                self.clean_ip_file
-            );
-            return;
-        };
 
         if let Some(parent) = Path::new(&self.clean_ip_file)
             .parent()
@@ -434,7 +477,7 @@ impl Scanner {
         if let Err(e) = tokio::fs::write(&self.clean_ip_file, content).await {
             tracing::error!("Failed to write to {}: {}", self.clean_ip_file, e);
         } else {
-            tracing::debug!("💾 Saved {} IPs to {}", ips.len(), self.clean_ip_file);
+            tracing::info!("💾 Saved {} clean IP(s) to {}", ips.len(), self.clean_ip_file);
         }
     }
 
@@ -473,6 +516,7 @@ impl Scanner {
                             if let Some(s) = v.as_str() {
                                 fetched_cidrs.push(s.to_string());
                             }
+        
                         }
 
                         fetch_success = !fetched_cidrs.is_empty()
@@ -514,11 +558,12 @@ impl Scanner {
             }
             ranges = parse_ranges(&final_list.join("\n"));
         }
-        
+
         ranges
     }
 
-    async fn find_new_ips(&self, count: usize) -> Vec<String> {
+    async fn find_new_ips(&self, count: usize, excluded_ips: &[String]) -> Vec<String> {
+        let scan_started = tokio::time::Instant::now();
         let weighted = self.is_arvan.load(Ordering::Relaxed);
         let ranges = if weighted {
             self.read_arvan_ranges().await
@@ -536,8 +581,13 @@ impl Scanner {
         }
 
         let mut found = Vec::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(count * 5);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bool, bool)>(32);
         let mut active_tasks = 0;
+        let mut attempted = 0usize;
+        let mut tcp_connected = 0usize;
+        let mut strict_checks = 0usize;
+        let mut strict_failures = 0usize;
+        const MAX_CONCURRENT_PROBES: usize = 32;
 
         let port_to_check = if let Some(r) = self.remotes.first() {
             if let Some(sni) = r.sni.first() {
@@ -550,66 +600,145 @@ impl Scanner {
         } else { "443".to_string() };
 
         let max_ping = std::time::Duration::from_millis(self.max_ping_ms);
+        tracing::info!(
+            "🛰️ Clean-IP scan started: target={} port={} requested={} ranges={} max_ping_ms={} concurrent_probes={}",
+            self.remotes
+                .first()
+                .and_then(|remote| remote.sni.first())
+                .map(String::as_str)
+                .unwrap_or("<none>"),
+            port_to_check,
+            count,
+            ranges.len(),
+            self.max_ping_ms,
+            MAX_CONCURRENT_PROBES
+        );
 
         for _ in 0..1000 {
             if found.len() >= count { break; }
             
-            // Prevent spawning too many tasks, block until one finishes
-            if active_tasks >= count * 3 {
-                if let Some(ip) = rx.recv().await {
+            if active_tasks >= MAX_CONCURRENT_PROBES {
+                if let Some((ip, tcp_ok, passed)) = rx.recv().await {
                     active_tasks -= 1;
-                    if !ip.is_empty() {
+                    if tcp_ok {
+                        tcp_connected += 1;
+                        strict_checks += 1;
+                    }
+                    if tcp_ok && passed {
                         found.push(ip);
                         if found.len() >= count { break; }
+                    } else if tcp_ok {
+                        strict_failures += 1;
                     }
                 }
             }
+            
+            attempted += 1;
 
             let ip_str = {
                 let range = pick_range(&ranges, weighted);
                 self.random_ip_from_subnet(range).to_string()
             };
-
-            let addr_str = format!("{}:{}", ip_str, port_to_check);
-            let addrs = tokio::net::lookup_host(&addr_str).await.ok().and_then(|mut it| it.next());
-            
-            if let Some(addr) = addrs {
-                // Ping Phase: TCP Connection with max_ping_ms
-                if let Ok(Ok(_)) = tokio::time::timeout(
-                    max_ping, 
-                    TcpStream::connect(addr)
-                ).await {
-                    // Ping passed! Start strict test in parallel
-                    let tx_clone = tx.clone();
-                    let tls = self.tls_connector.clone();
-                    let remotes = self.remotes.clone();
-                    let probe = self.probe.clone();
-                    active_tasks += 1;
-                    let ip_clone = ip_str.clone();
-                    
-                    tokio::spawn(async move {
-                        let max_ping_ms_val = max_ping.as_millis() as u64;
-                        if Self::strict_test_ip_static(&ip_clone, &remotes, &tls, max_ping_ms_val, &probe).await {
-                            let _ = tx_clone.send(ip_clone).await;
-                        } else {
-                            let _ = tx_clone.send(String::new()).await;
-                        }
-                    });
-                }
+            if excluded_ips.contains(&ip_str) || found.contains(&ip_str) {
+                continue;
             }
-            
-            // Rate Limiting: Prevent SYN flooding if connections fail immediately
+            let addr_str = format!("{}:{}", ip_str, port_to_check);
+            let tx_clone = tx.clone();
+            let tls = self.tls_connector.clone();
+            let remotes = self.remotes.clone();
+            let probe = self.probe.clone();
+            let ip_clone = ip_str.clone();
+            let max_ping_ms = self.max_ping_ms;
+            active_tasks += 1;
+
+            tokio::spawn(async move {
+                let tcp = match tokio::time::timeout(
+                    max_ping,
+                    TcpStream::connect(addr_str.as_str()),
+                )
+                .await
+                {
+                    Ok(Ok(tcp)) => Some(tcp),
+                    _ => None,
+                };
+                let tcp_ok = tcp.is_some();
+                let passed = if let Some(tcp) = tcp {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(25),
+                        Self::strict_test_ip_static(
+                            &ip_clone,
+                            &remotes,
+                            &tls,
+                            max_ping_ms,
+                            &probe,
+                            Some(tcp),
+                        ),
+                    )
+                    .await
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                let _ = tx_clone.send((ip_clone, tcp_ok, passed)).await;
+            });
+
+            // Keep the scan rate bounded while testing candidates concurrently.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if attempted % 250 == 0 {
+                tracing::debug!(
+                    "🛰️ Clean-IP scan progress: tried {} candidate(s), {} TCP connection(s), {} passed the protocol check",
+                    attempted,
+                    tcp_connected,
+                    found.len()
+                );
+            }
         }
 
-        // Drain remaining successful tasks
+        // Drain in-flight candidates after the bounded scan pass.
         while found.len() < count && active_tasks > 0 {
-            if let Some(ip) = rx.recv().await {
+            if let Some((ip, tcp_ok, passed)) = rx.recv().await {
                 active_tasks -= 1;
-                if !ip.is_empty() {
+                if tcp_ok {
+                    tcp_connected += 1;
+                    strict_checks += 1;
+                }
+                if tcp_ok && passed {
                     found.push(ip);
+                } else if tcp_ok {
+                    strict_failures += 1;
                 }
             }
+        }
+
+        if found.is_empty() {
+            if tcp_connected == 0 {
+                tracing::warn!(
+                    "🛰️ Clean-IP scan found no TCP-reachable candidates: tried {} addresses on port {} with max_ping_ms={} ({}ms elapsed)",
+                    attempted,
+                    port_to_check,
+                    self.max_ping_ms,
+                    scan_started.elapsed().as_millis()
+                );
+            } else {
+                tracing::warn!(
+                    "🛰️ Clean-IP scan reached {} candidate(s) over TCP, but all {} completed protocol checks failed ({} addresses tried, port {}, max_ping_ms={}, {}ms elapsed). Check SNI, tunnel secret, hidden path, and enabled protocol compatibility.",
+                    tcp_connected,
+                    strict_failures,
+                    attempted,
+                    port_to_check,
+                    self.max_ping_ms,
+                    scan_started.elapsed().as_millis()
+                );
+            }
+        } else {
+            tracing::info!(
+                "🛰️ Clean-IP scan found {} usable IP(s) after trying {} addresses ({} TCP connections, {} protocol checks, {}ms elapsed)",
+                found.len(),
+                attempted,
+                tcp_connected,
+                strict_checks,
+                scan_started.elapsed().as_millis()
+            );
         }
 
         found
@@ -629,7 +758,15 @@ impl Scanner {
     }
 
     async fn strict_test_ip(&self, ip: &str) -> bool {
-        Self::strict_test_ip_static(ip, &self.remotes, &self.tls_connector, self.max_ping_ms, &self.probe).await
+        Self::strict_test_ip_static(
+            ip,
+            &self.remotes,
+            &self.tls_connector,
+            self.max_ping_ms,
+            &self.probe,
+            None,
+        )
+        .await
     }
 
     async fn strict_test_ip_static(
@@ -638,20 +775,53 @@ impl Scanner {
         tls_connector: &TlsConnector,
         max_ping_ms: u64,
         probe: &ProbeCfg,
+        initial_tcp: Option<TcpStream>,
     ) -> bool {
-        // Find a remote location to get SNI
         if remotes.is_empty() {
             return false;
         }
+
+        let remotes = if probe.require_all_remotes {
+            remotes
+        } else {
+            &remotes[..1]
         
-        let remote = &remotes[0];
-        if remote.sni.is_empty() { return false; }
-        let sni = &remote.sni[0];
-        
+        };
+        let mut initial_tcp = initial_tcp;
+        for remote in remotes {
+            if remote.sni.is_empty() {
+                return false;
+            }
+            if !Self::strict_test_remote(
+                ip,
+                &remote.sni[0],
+                &remote.location,
+                tls_connector,
+                max_ping_ms,
+                probe,
+                initial_tcp.take(),
+            )
+            .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn strict_test_remote(
+        ip: &str,
+        sni: &str,
+        location: &str,
+        tls_connector: &TlsConnector,
+        max_ping_ms: u64,
+        probe: &ProbeCfg,
+        mut initial_tcp: Option<TcpStream>,
+    ) -> bool {
         let (sni_host, sni_port) = if let Some(idx) = sni.rfind(':') {
             (&sni[..idx], &sni[idx+1..])
         } else {
-            (sni.as_str(), "443")
+            (sni, "443")
         };
 
         let addr_str = if ip.contains(':') && !ip.starts_with('[') {
@@ -665,70 +835,136 @@ impl Scanner {
         };
 
         let connect_timeout = std::time::Duration::from_millis(max_ping_ms);
-        
-        // Resolve and connect TCP
-        let addrs = match tokio::net::lookup_host(&addr_str).await {
-            Ok(a) => a.collect::<Vec<_>>(),
-            Err(_) => return false,
-        };
 
-        let mut tcp_opt = None;
-        for addr in addrs {
-            if let Ok(Ok(stream)) = tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
-                tcp_opt = Some(stream);
-                break;
+        for protocol in &probe.protocols {
+            let tcp = match initial_tcp.take() {
+                Some(tcp) => tcp,
+                None => match tokio::time::timeout(
+                    connect_timeout,
+                    TcpStream::connect(addr_str.as_str()),
+                )
+                .await
+                {
+                    Ok(Ok(tcp)) => tcp,
+                    _ => continue,
+                },
+            };
+            let _ = tcp.set_nodelay(true);
+            crate::net_utils::enable_tcp_bbr(&tcp);
+            crate::net_utils::tune_socket_buffers(&tcp);
+            crate::net_utils::enable_tcp_keepalive(&tcp);
+
+            match protocol {
+                crate::transport::Proto::WssMux => {
+                    if crate::wssmux::probe_endpoint_with_location(
+                        tcp,
+                        sni,
+                        sni_host,
+                        &probe.hidden_path,
+                        &probe.secret,
+                        if location.is_empty() {
+                            probe.location.as_deref()
+                        } else {
+                            Some(location)
+                        },
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                crate::transport::Proto::H2 => {
+                    if Self::probe_h2_endpoint(
+                        tcp,
+                        sni,
+                        sni_host,
+                        &probe.hidden_path,
+                        &probe.secret,
+                        if location.is_empty() {
+                            probe.location.as_deref()
+                        } else {
+                            Some(location)
+                        },
+                        tls_connector,
+                    )
+                    .await
+                    {
+                        return true;
+                    }
+                }
             }
         }
+        false
+    }
 
-        let tcp = match tcp_opt {
-            Some(t) => t,
-            None => return false,
+    async fn probe_h2_endpoint(
+        tcp: TcpStream,
+        sni: &str,
+        sni_host: &str,
+        hidden_path: &str,
+        secret: &str,
+        location: Option<&str>,
+        tls_connector: &TlsConnector,
+    ) -> bool {
+        let Ok(domain) = rustls::pki_types::ServerName::try_from(sni_host) else {
+            return false;
         };
-
-        let _ = tcp.set_nodelay(true);
-        crate::net_utils::enable_tcp_bbr(&tcp);
-        crate::net_utils::tune_socket_buffers(&tcp);
-        crate::net_utils::enable_tcp_keepalive(&tcp);
-
-        // WssMux tunnels: test exactly what the tunnel does (TLS http/1.1 + WebSocket upgrade with the
-        // secret + ping/pong), so an IP that passes really carries WebSocket frames.
-        if probe.ws_first {
-            return match crate::wssmux::probe_endpoint(tcp, sni.as_str(), sni_host, &probe.hidden_path, &probe.secret).await {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::trace!("IP {} failed WssMux test: {}", ip, e);
-                    false
-                }
-            };
-        }
-
-        // TLS Handshake
-        let domain = match rustls::pki_types::ServerName::try_from(sni_host) {
-            Ok(d) => d.to_owned(),
-            Err(_) => return false,
-        };
-
-        let tls_stream = match tokio::time::timeout(
+        let Ok(Ok(tls)) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tls_connector.connect(domain, tcp)
-        ).await {
-            Ok(Ok(s)) => s,
-            _ => return false,
+            tls_connector.connect(domain.to_owned(), tcp),
+        )
+        .await
+        else {
+            return false;
         };
 
-        // H2 Handshake
-        let mut h2_builder = h2::client::Builder::new();
-        h2_builder.initial_window_size(33_554_432)
+        let mut builder = h2::client::Builder::new();
+        builder
+            .initial_window_size(33_554_432)
             .initial_connection_window_size(134_217_728)
             .max_frame_size(1_048_576);
-
-        match tokio::time::timeout(
+        let Ok(Ok((client, connection))) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            h2_builder.handshake::<_, bytes::Bytes>(tls_stream)
-        ).await {
-            Ok(Ok(_)) => true, // Successfully did H2 handshake
-            _ => false,
+            builder.handshake::<_, bytes::Bytes>(tls),
+        )
+        .await
+        else {
+            return false;
+        };
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let mut request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("https://{}{}", sni, hidden_path))
+            .header(http::header::HOST, sni)
+            .header("x-tunnel-secret", secret);
+        if let Some(location) = location {
+            request = request.header("x-tunnel-location", location);
         }
+        for (name, value) in crate::net_utils::get_random_headers() {
+            request = request.header(name, value);
+        }
+        let result = if let Ok(request) = request.body(()) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut request_client = client.clone().ready().await.map_err(|_| ())?;
+                let (response, _send_stream) =
+                    request_client.send_request(request, false).map_err(|_| ())?;
+                let response = response.await.map_err(|_| ())?;
+                Ok::<bool, ()>(response.status() == http::StatusCode::OK)
+            })
+            .await
+            {
+                Ok(Ok(valid)) => valid,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        connection_task.abort();
+        result
     }
 }
 

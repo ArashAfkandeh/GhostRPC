@@ -65,6 +65,19 @@ pub(crate) fn get_dead_targets() -> &'static RwLock<HashSet<String>> {
     DEAD_TARGETS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
+/// Read-only view for the admin panel.
+pub fn admin_snapshot() -> serde_json::Value {
+    let mut dead: Vec<String> = get_dead_targets().read().unwrap().iter().cloned().collect();
+    dead.sort();
+    serde_json::json!({
+        "accepts": {
+            "h2": crate::transport::server_accepts_h2(),
+            "wssmux": crate::transport::server_accepts_wssmux(),
+        },
+        "dead_targets": dead,
+    })
+}
+
 pub async fn run_server(
     cfg: ServerConfig,
     cancel_token: CancellationToken,
@@ -202,12 +215,13 @@ pub async fn run_server(
                             // Smart L4 TCP Probe: Wait up to 50ms to see if connection is instantly closed
                             let mut buf = [0u8; 1];
                             let is_up = match tokio::time::timeout(std::time::Duration::from_millis(50), tokio::io::AsyncReadExt::read(&mut tcp, &mut buf)).await {
+                            
                                 Ok(Ok(0)) => false, // Connection closed immediately (e.g. by anti-loop or RST)
                                 Ok(Err(_)) => false, // IO Error
                                 Ok(Ok(_)) => true, // Received data (upstream is alive and sending data)
                                 Err(_) => true, // Timeout, connection held open waiting for data (Healthy L4!)
                             };
-                            
+
                             if is_up {
                                 recovered_targets.push(target.clone());
                             } else {
@@ -321,6 +335,7 @@ pub async fn run_server(
 
     if bind_addrs.is_empty() {
         cancel_token.cancelled().await;
+        
         return;
     }
 
@@ -334,7 +349,7 @@ pub async fn run_server(
         let cfg_secret = cfg.secret.clone();
         let direct_route = local_direct_route.clone();
         let web_server_map = local_web_server_map.clone();
-        
+
         let handle = tokio::spawn(async move {
             let mut listener_opt = None;
             for i in 0..10 {
@@ -382,6 +397,7 @@ pub async fn run_server(
                                     handle_server_connection(
                                         tcp,
                                         peer,
+    
                                         acceptor_clone,
                                         cfg_path_clone,
                                         cfg_camo_clone,
@@ -401,7 +417,7 @@ pub async fn run_server(
         });
         handles.push(handle);
     }
-    
+
     for handle in handles {
         let _ = handle.await;
     }
@@ -629,6 +645,7 @@ pub async fn handle_server_connection(
     };
     if wire == crate::transport::Wire::WsMux {
         if crate::transport::server_accepts_wssmux() {
+            let _session_guard = crate::metrics::open_session("wssmux", "in", "direct", peer.to_string());
             crate::wssmux::serve_direct(
                 tls_stream,
                 peer,
@@ -660,6 +677,7 @@ pub async fn handle_server_connection(
         }
     };
 
+    let mut session_guard: Option<crate::metrics::SessionGuard> = None;
     while let Some(Ok((req, mut respond))) = h2.accept().await {
         let tunnel_target = if req.uri().path() != cfg_path {
             None
@@ -677,7 +695,8 @@ pub async fn handle_server_connection(
                     Some(t_val.to_string())
                 }
                 _ => {
-                    tracing::warn!(
+                    crate::metrics::add_unauthorized();
+                    tracing::debug!(
                         "Unauthorized or malformed request to hidden path from {}",
                         peer
                     );
@@ -787,6 +806,9 @@ pub async fn handle_server_connection(
             continue;
         }
 
+        if session_guard.is_none() {
+            session_guard = Some(crate::metrics::open_session("h2", "in", "direct", peer.to_string()));
+        }
         let mut target = tunnel_target.unwrap();
         if !target.contains(':') {
             target = format!("127.0.0.1:{}", target);
@@ -931,6 +953,7 @@ pub async fn handle_server_connection(
             };
 
             let target_tcp = tcp_stream.unwrap();
+            let _stream_guard = crate::metrics::open_stream("tunnel", "h2", peer.to_string(), target.clone());
             let _ = target_tcp.set_nodelay(true);
             crate::net_utils::tune_socket_buffers(&target_tcp);
             enable_tcp_keepalive(&target_tcp);
@@ -966,6 +989,7 @@ pub async fn handle_server_connection(
             let mut body = req.into_body();
             while let Some(Ok(mut data)) = body.data().await {
                 let _ = body.flow_control().release_capacity(data.len());
+                crate::metrics::add_rx(data.len());
 
                 if grpc_buf.is_empty() {
                     while data.len() >= 5 {

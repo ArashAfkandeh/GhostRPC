@@ -25,10 +25,11 @@ pub fn enable_tcp_linger_zero(stream: &TcpStream) {
 }
 
 pub fn tune_socket_buffers(stream: &TcpStream) {
+    
     // Only keeping socket reference for future tuning if needed.
     // Explicit SO_RCVBUF and SO_SNDBUF removed to allow Linux TCP Auto-Tuning.
     let _sock = SockRef::from(stream);
-    
+
     // Clamp TCP MSS to 1300 to fix MTU blackhole issues (very common in Iran)
     #[cfg(target_os = "linux")]
     {
@@ -67,11 +68,11 @@ pub fn enable_tcp_bbr(stream: &TcpStream) {
 }
 
 #[cfg(not(target_os = "linux"))]
+
+
 pub fn enable_tcp_bbr(_stream: &TcpStream) {
     // BBR setting is Linux-specific
 }
-
-
 
 pub fn get_random_headers() -> Vec<(&'static str, &'static str)> {
     let user_agents = [
@@ -120,6 +121,7 @@ pub fn create_reuseport_listener(addr_str: &str) -> std::io::Result<tokio::net::
     
     #[cfg(target_family = "unix")]
     if let Err(e) = socket.set_reuse_port(true) {
+    
         tracing::warn!("Failed to set SO_REUSEPORT (Hot-reload might drop connections during restart): {}", e);
     }
     
@@ -138,7 +140,7 @@ pub fn create_reuseport_listener(addr_str: &str) -> std::io::Result<tokio::net::
         }
     }
     socket.listen(1024)?; // backlog of 1024
-    
+
     let std_listener: std::net::TcpListener = socket.into();
     std_listener.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(std_listener)
@@ -153,9 +155,11 @@ pub async fn send_h2_data(send_stream: &mut h2::SendStream<bytes::Bytes>, mut da
         return Ok(());
     }
 
+    crate::metrics::add_tx(data.len());
     while !data.is_empty() {
         send_stream.reserve_capacity(data.len());
         if send_stream.capacity() == 0 {
+    
             if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await {
                 return Err(());
             }
@@ -182,7 +186,7 @@ pub fn log_rate_limited(key: &str, msg: &str) {
         Some(last_logged) => now.duration_since(*last_logged) > Duration::from_secs(10),
         None => true,
     };
-    
+
     if should_log {
         tracing::warn!("{}", msg);
         map.insert(key.to_string(), now);

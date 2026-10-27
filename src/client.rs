@@ -33,9 +33,10 @@ pub struct ConnectionState {
 mod tunnel_path_tests {
     use super::{
         TunnelPath, direct_probe_is_ready, effective_tunnel_health_interval,
-        select_stable_tunnel_path, select_tunnel_path,
+        select_stable_tunnel_path, select_tunnel_path, tunnel_path_check_interval,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn direct_is_preferred_over_reverse() {
@@ -53,7 +54,7 @@ mod tunnel_path_tests {
     }
 
     #[test]
-    fn reverse_path_requires_two_periodic_checks_before_direct_recovery() {
+    fn reverse_path_requires_three_periodic_checks_before_direct_recovery() {
         let recovery_checks = AtomicUsize::new(0);
 
         assert_eq!(
@@ -66,7 +67,40 @@ mod tunnel_path_tests {
         );
         assert_eq!(
             select_stable_tunnel_path(TunnelPath::Reverse, true, true, true, &recovery_checks),
+            TunnelPath::Reverse
+        );
+        assert_eq!(
+            select_stable_tunnel_path(TunnelPath::Reverse, true, true, true, &recovery_checks),
             TunnelPath::Direct
+        );
+    }
+
+    #[test]
+    fn one_failed_direct_health_check_does_not_change_paths() {
+        let health_checks = AtomicUsize::new(0);
+
+        assert_eq!(
+            select_stable_tunnel_path(TunnelPath::Direct, false, true, true, &health_checks),
+            TunnelPath::Direct
+        );
+        assert_eq!(
+            select_stable_tunnel_path(TunnelPath::Direct, true, true, true, &health_checks),
+            TunnelPath::Direct
+        );
+        assert_eq!(health_checks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn direct_failover_requires_two_consecutive_failed_health_checks() {
+        let health_checks = AtomicUsize::new(0);
+
+        assert_eq!(
+            select_stable_tunnel_path(TunnelPath::Direct, false, true, true, &health_checks),
+            TunnelPath::Direct
+        );
+        assert_eq!(
+            select_stable_tunnel_path(TunnelPath::Direct, false, true, true, &health_checks),
+            TunnelPath::Reverse
         );
     }
 
@@ -104,8 +138,8 @@ mod tunnel_path_tests {
     }
 
     #[test]
-    fn tunnel_health_interval_defaults_to_one_minute_and_clamps_zero() {
-        assert_eq!(effective_tunnel_health_interval(None), 1);
+    fn tunnel_health_interval_defaults_to_five_minutes_and_clamps_zero() {
+        assert_eq!(effective_tunnel_health_interval(None), 5);
         assert_eq!(effective_tunnel_health_interval(Some(0)), 1);
         assert_eq!(effective_tunnel_health_interval(Some(12)), 12);
     }
@@ -126,7 +160,9 @@ mod tunnel_path_tests {
     }
 }
 
-const DEFAULT_TUNNEL_HEALTH_CHECK_INTERVAL_MINUTES: u64 = 1;
+const DEFAULT_TUNNEL_HEALTH_CHECK_INTERVAL_MINUTES: u64 = 5;
+const DIRECT_FAILURE_CONFIRMATION_CHECKS: usize = 2;
+const DIRECT_RECOVERY_CONFIRMATION_CHECKS: usize = 3;
 const TUNNEL_PATH_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 fn effective_tunnel_health_interval(configured: Option<u64>) -> u64 {
@@ -208,16 +244,48 @@ fn select_stable_tunnel_path(
     periodic_check: bool,
     direct_recovery_checks: &AtomicUsize,
 ) -> TunnelPath {
-    if current == TunnelPath::Reverse && direct_ready && reverse_ready {
-        if !periodic_check || direct_recovery_checks.fetch_add(1, Ordering::Relaxed) + 1 < 2 {
-            return TunnelPath::Reverse;
+    match current {
+        TunnelPath::Direct if direct_ready => {
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Direct
         }
-        direct_recovery_checks.store(0, Ordering::Relaxed);
-        return TunnelPath::Direct;
+        TunnelPath::Direct if reverse_ready => {
+            if periodic_check
+                && direct_recovery_checks.fetch_add(1, Ordering::Relaxed) + 1
+                    < DIRECT_FAILURE_CONFIRMATION_CHECKS
+            {
+                return TunnelPath::Direct;
+            }
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Reverse
+        }
+        TunnelPath::Reverse if direct_ready && !reverse_ready => {
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Direct
+        }
+        TunnelPath::Reverse if direct_ready && reverse_ready => {
+            if !periodic_check
+                || direct_recovery_checks.fetch_add(1, Ordering::Relaxed) + 1
+                    < DIRECT_RECOVERY_CONFIRMATION_CHECKS
+            {
+                return TunnelPath::Reverse;
+            }
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Direct
+        }
+        TunnelPath::Reverse if reverse_ready => {
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Reverse
+        }
+        TunnelPath::Direct | TunnelPath::Reverse => {
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            TunnelPath::Unavailable
+        }
+        TunnelPath::Starting | TunnelPath::Unavailable => {
+            direct_recovery_checks.store(0, Ordering::Relaxed);
+            select_tunnel_path(direct_ready, reverse_ready)
+        }
     }
-
-    direct_recovery_checks.store(0, Ordering::Relaxed);
-    select_tunnel_path(direct_ready, reverse_ready)
 }
 
 fn tunnel_path_check_interval(current: TunnelPath, configured: Duration) -> Duration {
@@ -231,7 +299,13 @@ fn tunnel_path_check_interval(current: TunnelPath, configured: Duration) -> Dura
 fn publish_tunnel_path(state: &AtomicU8, next: TunnelPath) {
     let previous = state.swap(next as u8, Ordering::AcqRel);
     if previous != next as u8 {
-        info!("🔀 Active tunnel path changed: {:?}", next);
+        if next == TunnelPath::Unavailable {
+            warn!(
+                "No tunnel connection is available: all Direct and Reverse paths failed across the configured protocols."
+            );
+        } else {
+            info!("🔀 Active tunnel path changed: {:?}", next);
+        }
     }
 }
 
@@ -395,7 +469,6 @@ async fn connect_h2_node(
                 {
                     Ok(Ok(_)) => {}
                     _ => {
-                        tracing::warn!("H2 Ping failed or timed out. Dropping connection.");
                         break;
                     }
                 }
@@ -425,6 +498,190 @@ pub fn get_client_dead_targets() -> &'static std::sync::RwLock<std::collections:
     CLIENT_DEAD_TARGETS.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
 }
 
+// ==========================================================================
+// ADMIN PANEL HOOKS (read-only view of the Direct pool for `admin.rs`)
+// ==========================================================================
+
+struct AdminHandle {
+    pool: Arc<Vec<(Arc<Mutex<ConnectionState>>, ActiveNode)>>,
+    path: Arc<AtomicU8>,
+    clean_ips: Arc<tokio::sync::RwLock<Vec<String>>>,
+    clean_ip_file: String,
+    scanner_refresh: Option<Arc<tokio::sync::Notify>>,
+    scan_generation: Arc<std::sync::atomic::AtomicU64>,
+    cache_lock: Arc<tokio::sync::Mutex<()>>,
+    protocols: Vec<Proto>,
+}
+
+static ADMIN_HANDLE: std::sync::RwLock<Option<Arc<AdminHandle>>> = std::sync::RwLock::new(None);
+
+fn admin_handle() -> Option<Arc<AdminHandle>> {
+    ADMIN_HANDLE.read().unwrap().clone()
+}
+
+/// "starting" | "direct" | "reverse" | "unavailable" (None before the client has started).
+pub fn admin_path_name() -> Option<&'static str> {
+    let h = admin_handle()?;
+    Some(match TunnelPath::load(&h.path) {
+        TunnelPath::Starting => "starting",
+        TunnelPath::Direct => "direct",
+        TunnelPath::Reverse => "reverse",
+        TunnelPath::Unavailable => "unavailable",
+    })
+}
+
+/// Number of Direct pool slots currently connected over (HTTP/2, WssMux).
+pub async fn admin_pool_counts() -> (usize, usize) {
+    let Some(h) = admin_handle() else {
+        return (0, 0);
+    };
+    let (mut h2, mut wss) = (0, 0);
+    for (slot, _) in h.pool.iter() {
+        if let Ok(g) = tokio::time::timeout(Duration::from_millis(100), slot.lock()).await {
+            if g.client.is_some() {
+                h2 += 1;
+            } else if g.mux.as_ref().is_some_and(crate::wssmux::MuxClient::alive) {
+                wss += 1;
+            }
+        }
+    }
+    (h2, wss)
+}
+
+/// Snapshot of the Direct pool, grouped per node, plus the clean-IP list.
+pub async fn admin_snapshot() -> Option<serde_json::Value> {
+    let h = admin_handle()?;
+    struct Agg {
+        location: String,
+        sni: String,
+        share_sni: u32,
+        slots: usize,
+        h2: usize,
+        wss: usize,
+        busy: usize,
+        lat_sum: f64,
+        lat_n: usize,
+        errors: u32,
+    }
+    let mut nodes: Vec<Agg> = Vec::new();
+    for (slot, node) in h.pool.iter() {
+        let idx = match nodes
+            .iter()
+            .position(|a| a.sni == node.sni && a.location == node.location)
+        {
+            Some(i) => i,
+            None => {
+                nodes.push(Agg {
+                    location: node.location.clone(),
+                    sni: node.sni.clone(),
+                    share_sni: node.share_sni,
+                    slots: 0,
+                    h2: 0,
+                    wss: 0,
+                    busy: 0,
+                    lat_sum: 0.0,
+                    lat_n: 0,
+                    errors: 0,
+                });
+                nodes.len() - 1
+            }
+        };
+        let a = &mut nodes[idx];
+        a.slots += 1;
+        match tokio::time::timeout(Duration::from_millis(100), slot.lock()).await {
+            Ok(g) => {
+                let is_h2 = g.client.is_some();
+                let is_ws = !is_h2 && g.mux.as_ref().is_some_and(crate::wssmux::MuxClient::alive);
+                if is_h2 {
+                    a.h2 += 1;
+                } else if is_ws {
+                    a.wss += 1;
+                }
+                if is_h2 || is_ws {
+                    a.lat_sum += g.ewma_latency;
+                    a.lat_n += 1;
+                }
+                a.errors = a.errors.max(g.consecutive_errors);
+            }
+            Err(_) => a.busy += 1,
+        }
+    }
+    let (mut total_h2, mut total_wss, mut total_slots) = (0, 0, 0);
+    let nodes_json: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|a| {
+            total_h2 += a.h2;
+            total_wss += a.wss;
+            total_slots += a.slots;
+            serde_json::json!({
+                "location": a.location,
+                "sni": a.sni,
+                "share_sni": a.share_sni,
+                "slots": a.slots,
+                "h2": a.h2,
+                "wssmux": a.wss,
+                "down": a.slots - a.h2 - a.wss,
+                "latency_ms": if a.lat_n > 0 { Some((a.lat_sum / a.lat_n as f64).round()) } else { None },
+                "errors": a.errors,
+                "cooling_h2": crate::transport::is_cooling(&a.sni, Proto::H2),
+                "cooling_wssmux": crate::transport::is_cooling(&a.sni, Proto::WssMux),
+            })
+        })
+        .collect();
+    let ips = h.clean_ips.read().await;
+    let mut dead: Vec<String> = get_client_dead_targets().read().unwrap().iter().cloned().collect();
+    dead.sort();
+    Some(serde_json::json!({
+        "path": admin_path_name(),
+        "protocols": h.protocols.iter().map(|p| p.name()).collect::<Vec<_>>(),
+        "pool": { "slots": total_slots, "h2": total_h2, "wssmux": total_wss, "down": total_slots - total_h2 - total_wss },
+        "nodes": nodes_json,
+        "clean_ips": { "count": ips.len(), "list": ips.iter().take(300).collect::<Vec<_>>(), "scanner_running": h.scanner_refresh.is_some() },
+        "dead_targets": dead,
+    }))
+}
+
+/// Clears the active and persisted clean-IP cache, then requests an immediate scanner cycle.
+pub async fn admin_clear_clean_ips() -> std::io::Result<usize> {
+    let handle = admin_handle().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "client is not initialized",
+        )
+    })?;
+    let refresh = handle.scanner_refresh.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "direct IP scanner is not running",
+        )
+    })?;
+
+    let _cache_guard = handle.cache_lock.lock().await;
+    let mut ips = handle.clean_ips.write().await;
+    let cleared = ips.len();
+    if let Some(parent) = std::path::Path::new(&handle.clean_ip_file)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let cache_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&handle.clean_ip_file)
+        .await?;
+    cache_file.sync_all().await?;
+    handle
+        .scan_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    ips.clear();
+    drop(ips);
+    drop(_cache_guard);
+    refresh.notify_one();
+    Ok(cleared)
+}
+
 pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     let mut flat_remotes = Vec::new();
     for loc in cfg.remotes.iter() {
@@ -449,7 +706,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     // Direct tunnel protocol priority (`[client].protocols`): first = preferred, others = fallbacks.
     let protocols = crate::transport::parse_list(cfg.protocols.as_ref(), "client");
     if !flat_remotes.is_empty() {
-        info!(
+        debug!(
             "🔀 Direct tunnel protocols (priority): {}",
             protocols
                 .iter()
@@ -484,7 +741,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     let total_pool_size = flat_remotes.len() * pool_per_node;
 
     if !flat_remotes.is_empty() {
-        info!(
+        debug!(
             "Initializing Distributed Pool ({} nodes x {} conns = {} total streams)...",
             flat_remotes.len(),
             pool_per_node,
@@ -530,11 +787,14 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     };
 
     let clean_ips_global = Arc::new(tokio::sync::RwLock::new(initial_ips));
+    let scan_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cache_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     // Start IP Scanner (background periodic refresh)
-    if !flat_remotes.is_empty() {
+    let scanner_refresh = if !flat_remotes.is_empty() {
+        let refresh = Arc::new(tokio::sync::Notify::new());
         let scanner = crate::scanner::Scanner::new(
-            clean_ip_file,
+            clean_ip_file.clone(),
             source_ips_file,
             check_interval_minutes,
             max_ping_ms,
@@ -549,9 +809,15 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
             cfg.hidden_path.clone(),
             cfg.secret.clone().unwrap_or_default(),
             protocols.clone(),
+            refresh.clone(),
+            scan_generation.clone(),
+            cache_lock.clone(),
         );
         scanner.start(cancel_token.clone());
-    }
+        Some(refresh)
+    } else {
+        None
+    };
 
     // Eager Direct Pool Maintainer (Background Connect)
     if !flat_remotes.is_empty() {
@@ -612,14 +878,9 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                             );
                                             connected = true;
                                         }
-                                        Err(e) => {
+                                        Err(_e) => {
                                             // (h2 is only marked healthy again after a tunnel request succeeded)
                                             crate::transport::record_fail(&remote.sni, Proto::H2);
-                                            tracing::debug!(
-                                                "⚠️ Pool Maintainer: h2 connect to {} failed: {}",
-                                                remote.sni,
-                                                e
-                                            );
                                         }
                                     },
                                     Proto::WssMux => {
@@ -649,15 +910,10 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                 );
                                                 connected = true;
                                             }
-                                            Err(e) => {
+                                            Err(_e) => {
                                                 crate::transport::record_fail(
                                                     &remote.sni,
                                                     Proto::WssMux,
-                                                );
-                                                tracing::debug!(
-                                                    "⚠️ Pool Maintainer: wssmux connect to {} failed: {}",
-                                                    remote.sni,
-                                                    e
                                                 );
                                             }
                                         }
@@ -665,16 +921,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                 }
                                 if connected {
                                     break;
-                                }
-                                if protocols.len() > 1 {
-                                    crate::net_utils::log_rate_limited(
-                                        &format!("direct_switch_{}_{}", remote.sni, proto.name()),
-                                        &format!(
-                                            "🔀 Direct {}: protocol {} is unavailable, switching to the next one",
-                                            remote.sni,
-                                            proto.name()
-                                        ),
-                                    );
                                 }
                             }
                             if connected {
@@ -686,11 +932,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                     std::cmp::min(max_backoff_ms, (backoff_ms as f64 * 1.5) as u64);
                                 let jitter = (rand::random::<u64>() % 1000) + 100;
                                 backoff_ms = std::cmp::min(max_backoff_ms, backoff_ms + jitter);
-                                tracing::debug!(
-                                    "⚠️ Pool Maintainer: Failed to connect to {} with every protocol, backing off for {}ms",
-                                    remote.sni,
-                                    backoff_ms
-                                );
                             }
                         }
                     } else {
@@ -714,14 +955,13 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                 return;
             }
             if has_direct_path(&pool).await {
-                info!(
+                debug!(
                     "✅ Direct startup check completed in {}ms.",
                     warmup_start.elapsed().as_millis()
                 );
                 break;
             }
             if warmup_start.elapsed() > warmup_timeout {
-                warn!("⚠️ Direct startup check timed out after 30s; checking Reverse next.");
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -731,6 +971,16 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
     let active_tunnel_path = Arc::new(AtomicU8::new(TunnelPath::Starting as u8));
     let direct_recovery_checks = Arc::new(AtomicUsize::new(0));
     let tunnel_path_update_lock = Arc::new(Mutex::new(()));
+    *ADMIN_HANDLE.write().unwrap() = Some(Arc::new(AdminHandle {
+        pool: pool.clone(),
+        path: active_tunnel_path.clone(),
+        clean_ips: clean_ips_global.clone(),
+        clean_ip_file,
+        scanner_refresh,
+        scan_generation,
+        cache_lock,
+        protocols: protocols.clone(),
+    }));
     refresh_tunnel_path(
         &pool,
         reverse_enabled,
@@ -740,7 +990,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
         &tunnel_path_update_lock,
     )
     .await;
-    info!(
+    debug!(
         "🩺 Tunnel path monitor interval: {} minute(s), preference: Direct then Reverse.",
         tunnel_health_check_interval_minutes
     );
@@ -783,7 +1033,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                 "🚀 Admin Panel / Web Server configured for domain: {}",
                 ws.domain
             );
-            tracing::info!("   👉 Access the panel at: https://{}/panel", ws.domain);
+            tracing::info!("👉 Access the panel at: https://{}", ws.domain);
         }
         if !ws_configs.is_empty() {
             web_server_routes = ws_configs.clone();
@@ -938,7 +1188,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                 continue;
             }
         };
-        info!(
+        debug!(
             "🚀 Listener active on {} with {} SNI rules",
             local_bind,
             route_table.sni_rules.len()
@@ -1120,7 +1370,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         }
                                     },
                                     None => {
-                                        warn!("[Conn #{}] Connection from {} dropped: No matching SNI or default route.", c_id, peer);
+                                        debug!("[Conn #{}] Connection from {} dropped: No matching SNI or default route.", c_id, peer);
                                         return;
                                     }
                                 };
@@ -1153,10 +1403,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                     }
                                 }
                                 if !matches!(selected_path, TunnelPath::Direct | TunnelPath::Reverse) {
-                                    crate::net_utils::log_rate_limited(
-                                        "no_healthy_tunnel_path",
-                                        "⚠️ No healthy Direct or Reverse tunnel path is currently available.",
-                                    );
                                     return;
                                 }
 
@@ -1341,10 +1587,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                             &path_update_lock,
                                         )
                                         .await;
-                                        crate::net_utils::log_rate_limited(
-                                            "all_tunnel_paths_unavailable",
-                                            "⚠️ No Direct or Reverse tunnel path is available; incoming connections are being dropped until a path recovers.",
-                                        );
                                         return;
                                     }
 
@@ -1388,9 +1630,9 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                         // reconnects (trying the other protocol first).
                                                         slot.lock().await.mux = None;
                                                         crate::transport::record_fail(&remote.sni, Proto::WssMux);
-                                                        tracing::warn!("[Conn #{}] WssMux session to {} is broken; trying another tunnel.", c_id, remote.sni);
+                                                        tracing::debug!("[Conn #{}] WssMux session to {} is broken; trying another tunnel.", c_id, remote.sni);
                                                     } else {
-                                                        tracing::warn!("[Conn #{}] WssMux tunnel via {} failed (target unreachable?); trying another tunnel.", c_id, remote.sni);
+                                                        tracing::debug!("[Conn #{}] WssMux tunnel via {} failed (target unreachable?); trying another tunnel.", c_id, remote.sni);
                                                     }
                                                     failed_snis.insert(remote.sni.clone());
                                                     global_retries += 1;
@@ -1431,7 +1673,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     break;
                                                 }
                                                 Err(()) => {
-                                                    tracing::warn!("[Conn #{}] Reverse stream for '{}' failed; trying another tunnel.", c_id, loc);
+                                                    tracing::debug!("[Conn #{}] Reverse stream for '{}' failed; trying another tunnel.", c_id, loc);
                                                     failed_snis.insert(format!("rev:{}", loc));
                                                     global_retries += 1;
                                                     continue;
@@ -1487,7 +1729,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     final_body = Some(res.into_body());
                                                     break;
                                                 }
-                                                tracing::warn!("[Conn #{}] Tunnel failed! Remote server {} returned HTTP {}", c_id, target_remote.sni, res.status());
+                                                tracing::debug!("[Conn #{}] Tunnel failed! Remote server {} returned HTTP {}", c_id, target_remote.sni, res.status());
                                                 let mut slot = pool_slot.lock().await;
                                                 slot.ewma_latency += 5000.0;
                                                 slot.client = None;
@@ -1516,6 +1758,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
 
                                 if let Some(st) = final_mux {
                                     // WssMux tunnel (Direct slot or Reverse session): raw bytes over a yamux stream.
+                                    let _stream_guard = crate::metrics::open_stream("user", "wssmux", peer.to_string(), target_up.clone());
                                     crate::wssmux::pipe_user(local_read, local_write, &initial_data, st).await;
                                     return;
                                 }
@@ -1530,11 +1773,11 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         &path_update_lock,
                                     )
                                     .await;
-                                    tracing::warn!("[Conn #{}] All tunnel attempts failed.", c_id);
                                     return;
                                 }
 
                                 let mut send_stream = final_send_stream.unwrap();
+                                let _stream_guard = crate::metrics::open_stream("user", "h2", peer.to_string(), target_up.clone());
 
                                 let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
                                 tokio::spawn(async move {
@@ -1584,6 +1827,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         }
                                         while let Some(Ok(mut data)) = body.data().await {
                                             let _ = body.flow_control().release_capacity(data.len());
+                                            crate::metrics::add_rx(data.len());
 
                                             if grpc_buf.is_empty() {
                                                 while data.len() >= 5 {

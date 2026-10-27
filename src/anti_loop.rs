@@ -11,10 +11,11 @@ use std::sync::LazyLock;
 pub static OUTBOUND_LOCAL_ADDRS: LazyLock<DashMap<SocketAddr, Instant>> = LazyLock::new(|| DashMap::new());
 
 /// Records the source port of an outbound socket before it initiates the TCP SYN.
+    
 pub fn track_outbound(addr: SocketAddr) {
     let now = Instant::now();
     OUTBOUND_LOCAL_ADDRS.insert(addr, now);
-    
+
     // Amortized lazy cleanup: 10% chance per insertion to clean up old entries.
     // We only need to track the address for a few seconds to detect loops.
     // If a connection takes > 10 seconds to loop back, it's either dropped or invalid anyway.
@@ -47,12 +48,13 @@ pub async fn safe_connect<A: tokio::net::ToSocketAddrs + std::fmt::Display>(
         };
 
         // Try to bind to an ephemeral port
+        
         let bind_addr: SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
-        
+
         let _ = socket.bind(bind_addr); // Ignore error; OS will assign on connect if bind fails
 
         let mut tracked_addr = None;

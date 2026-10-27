@@ -2,10 +2,11 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 /// Resolves the SNI dynamically using DNS and returns an established TCP connection
+    
 pub async fn resolve_and_connect(sni: &str, port: u16) -> Option<TcpStream> {
     let addr_str = format!("{}:{}", sni, port);
     debug!("Dynamic SNI Proxy: Attempting to resolve {}", addr_str);
-    
+
     match tokio::net::lookup_host(&addr_str).await {
         Ok(addrs) => {
             for addr in addrs {
