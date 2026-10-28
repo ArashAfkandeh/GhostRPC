@@ -188,6 +188,9 @@ ln -sf /root/GhostRPC/ghostrpc.sh /usr/local/bin/ghostrpc
 
 echo -e "\n\033[0;32m✅ GhostRPC installation completed successfully!\033[0m"
 echo -e "🌐 Panel: \033[0;32m$PANEL_URL\033[0m"
+echo -e "👤 Username: \033[0;36madmin\033[0m"
+echo -e "🔑 Password: \033[0;36madmin\033[0m"
+echo -e "\033[0;33m⚠️ Change the default panel credentials after your first login.\033[0m"
 echo -e "\033[0;33m💡 Thanks to Hot-Reload, you can edit your configs anytime after installation without restarting!\033[0m"
 echo -e "\033[0;36m========================================================================\033[0m"
 echo -e "To manage your service, simply type the following command from anywhere:"
